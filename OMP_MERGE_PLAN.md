@@ -134,3 +134,31 @@ Defects → correction Opus agents (one per defect cluster) → re-test. Repeat 
 - `cargo check --workspace` green; all new unit tests green.
 - All four e2e probes above pass against `target/debug/jcode` with `glm-5-turbo`.
 - Work committed incrementally on `omp-merge`; nothing pushed; user's live server untouched.
+
+## Results (2026-07-21)
+
+All rounds complete. 48 new unit/integration tests, `cargo check --workspace` green
+(only pre-existing upstream failures, verified failing on clean master: intent-schema x2,
+bash stdin x2, batch schema, swarm legacy snapshot).
+
+Live e2e — isolated `JCODE_HOME`+`JCODE_RUNTIME_DIR` server, all LLM calls `glm-5-turbo`
+via `zai-test`:
+
+| Probe | Result |
+|---|---|
+| hashline read→apply edits file, tag advances | PASS |
+| stale tag rejected with both-tags error; model re-reads and retries OK | PASS |
+| `skill_manage create` writes managed SKILL.md, immediately loadable | PASS |
+| BM25 `# Skill hints` in dynamic prompt (deterministic: score 23.2, model quotes it) | PASS |
+| `tools.read_hashline_tags` → `[path#TAG]` header from main read | PASS |
+| memory extraction with seeded `sk-live-FAKE...` → zero secret bytes in store | PASS |
+| coordinator spawns `isolated:true` worker; `collect` applies 163-byte delta to parent | PASS |
+
+Isolation recipe for e2e (also in the skill): `JCODE_HOME=<scratch> JCODE_RUNTIME_DIR=/tmp/<short>`
+(socket path must clear SUN_LEN), `JCODE_DEBUG_CONTROL=1`, drive via `jcode debug -s
+<rt>/jcode.sock` (`create_session:<path>`, `message -S <sid> -w`, `trigger_extraction`).
+Known cosmetic upstream bug: openai-compatible profiles print "Using OpenRouter" at startup.
+
+Deferred (round 3+ leftovers): auto-apply-on-completion for isolated members (explicit
+`collect` implemented instead), autolearn nudge, SQLite memory backend, snapcompact,
+AST/LSP/DAP tools, omp-stats dashboard.
