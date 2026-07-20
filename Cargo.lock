@@ -3596,6 +3596,7 @@ name = "jcode-hashline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "similar",
  "tempfile",
 ]
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,11 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<String>,
+    /// True when this skill was authored by the agent via `skill_manage`
+    /// (create/update). Only managed skills may be updated/deleted or safely
+    /// overwritten; hand-authored skills (no marker) are never clobbered.
+    #[serde(default)]
+    managed: bool,
 }
 
 /// Registry of available skills
@@ -491,6 +496,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            ..
         } = frontmatter;
 
         let allowed_tools =
@@ -882,6 +888,38 @@ pub fn endorsed_skills() -> &'static [EndorsedSkill] {
     ENDORSED_SKILLS
 }
 
+/// True if the SKILL.md at `path` was authored by the agent (`managed: true`
+/// in its YAML frontmatter). A missing/unparsable/unmarked file reads as false,
+/// so the create/update/delete paths never overwrite hand-authored skills.
+pub fn is_managed_skill_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| SkillRegistry::parse_frontmatter(&content).ok())
+        .map(|(frontmatter, _body)| frontmatter.managed)
+        .unwrap_or(false)
+}
+
+#[derive(Serialize)]
+struct ManagedFrontmatter<'a> {
+    name: &'a str,
+    description: &'a str,
+    managed: bool,
+}
+
+/// Render a managed SKILL.md document: YAML frontmatter (`name`, `description`,
+/// `managed: true`) followed by `body`. serde_yaml quotes values as needed so
+/// descriptions containing YAML-special characters round-trip through
+/// [`SkillRegistry::parse_frontmatter`].
+pub fn managed_skill_document(name: &str, description: &str, body: &str) -> String {
+    let frontmatter = serde_yaml::to_string(&ManagedFrontmatter {
+        name,
+        description,
+        managed: true,
+    })
+    .unwrap_or_else(|_| format!("name: {name}\ndescription: {description}\nmanaged: true\n"));
+    format!("---\n{}---\n\n{}\n", frontmatter, body.trim_end_matches('\n'))
+}
+
 impl Skill {
     /// Get the full prompt content for this skill
     pub fn get_prompt(&self) -> String {
@@ -889,6 +927,12 @@ impl Skill {
             "# Skill: {}\n\n{}\n\n{}",
             self.name, self.description, self.content
         )
+    }
+
+    /// Normalized search text (name + description + body) used for BM25
+    /// auto-suggestion. Built once at parse time; see [`skill_match`].
+    pub fn search_text(&self) -> &str {
+        &self.search_text
     }
 
     /// Load additional files from the skill directory
@@ -926,7 +970,7 @@ fn build_skill_search_text(name: &str, description: &str, content: &str) -> Stri
     normalize_skill_search_text(&format!("{}\n{}\n{}", name, description, content))
 }
 
-fn normalize_skill_search_text(text: &str) -> String {
+pub(crate) fn normalize_skill_search_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .map(|c| {

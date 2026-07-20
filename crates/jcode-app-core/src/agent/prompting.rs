@@ -55,6 +55,64 @@ impl Agent {
         pending
     }
 
+    /// Latest genuine user prose from the transcript, used as the BM25 query
+    /// for skill auto-suggestion. Skips tool-result and system-reminder
+    /// messages so the query reflects the user's current intent.
+    fn latest_user_query(&self) -> Option<String> {
+        use crate::message::{ContentBlock, Role};
+        self.session.messages.iter().rev().find_map(|m| {
+            if m.role != Role::User || m.display_role.is_some() {
+                return None;
+            }
+            let text = m
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let trimmed = text.trim();
+            if trimmed.is_empty() || trimmed.starts_with("<system-reminder>") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
+    /// Append a short "Skill hints" section to the dynamic (uncached) prompt
+    /// when the latest user message BM25-matches loaded skills. Suggestions are
+    /// displayed name-sorted so the same set renders identical bytes turn to
+    /// turn.
+    fn append_skill_hints(
+        &self,
+        split: &mut crate::prompt::SplitSystemPrompt,
+        skills: &crate::skill::SkillRegistry,
+    ) {
+        let Some(query) = self.latest_user_query() else {
+            return;
+        };
+        let mut hints = crate::skill_match::suggest_skills(skills, &query, 3);
+        if hints.is_empty() {
+            return;
+        }
+        hints.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut section =
+            String::from("# Skill hints\n\nPossibly relevant skills (load with skill_manage):\n");
+        for (name, _score) in &hints {
+            let description = skills.get(name).map(|s| s.description.as_str()).unwrap_or("");
+            section.push_str(&format!("- {name} — {description}\n"));
+        }
+
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(section.trim_end());
+    }
+
     fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {
         let Some(reminder) = self
             .current_turn_system_reminder
@@ -116,6 +174,7 @@ impl Agent {
         );
 
         self.append_current_turn_system_reminder(&mut split);
+        self.append_skill_hints(&mut split, skills.as_ref());
         crate::prompt::append_swarm_effort_directive(
             &mut split,
             self.provider.reasoning_effort().as_deref(),

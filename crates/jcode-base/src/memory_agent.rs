@@ -38,6 +38,21 @@ struct RetrievalContext {
 /// Channel capacity for context updates
 const CONTEXT_CHANNEL_CAPACITY: usize = 16;
 
+/// Build a `MemoryEntry` from sidecar-extracted (model-authored) memory content,
+/// redacting secrets first so credentials never leak into persistent memory.
+/// Only for model-extracted text — user-explicit `memory remember` tool calls are
+/// stored verbatim (user intent wins), so they must not route through here.
+fn extracted_memory_entry(
+    category: memory::MemoryCategory,
+    content: &str,
+    source: &str,
+    trust: memory::TrustLevel,
+) -> MemoryEntry {
+    MemoryEntry::new(category, crate::message::redact_secrets(content))
+        .with_source(source)
+        .with_trust(trust)
+}
+
 /// Similarity threshold for topic change detection (lower = more different)
 const TOPIC_CHANGE_THRESHOLD: f32 = 0.3;
 
@@ -200,9 +215,7 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
                     _ => crate::memory::TrustLevel::Medium,
                 };
 
-                let entry = crate::memory::MemoryEntry::new(category, &mem.content)
-                    .with_source(&session_id)
-                    .with_trust(trust);
+                let entry = extracted_memory_entry(category, &mem.content, &session_id, trust);
 
                 if manager.remember_project(entry).is_ok() {
                     stored_count += 1;
@@ -1100,9 +1113,8 @@ impl MemoryAgent {
                             };
 
                         // Create the new memory
-                        let entry = memory::MemoryEntry::new(category, &mem.content)
-                            .with_source("incremental")
-                            .with_trust(trust);
+                        let entry =
+                            extracted_memory_entry(category, &mem.content, "incremental", trust);
 
                         match memory_manager.remember_project(entry) {
                             Ok(new_id) => {

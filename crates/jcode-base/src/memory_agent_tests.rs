@@ -184,3 +184,52 @@ fn dynamic_gate_empty_input_returns_empty() {
     let out = dynamic_gate_select(Vec::new(), 5);
     assert!(out.is_empty());
 }
+
+#[test]
+fn extracted_memory_redacts_secrets_before_storing() {
+    // Both sidecar finalization paths route model-extracted content through
+    // extracted_memory_entry, which must scrub credentials before persistence.
+    let secret_token = "sk-ant-oat01-abcdefghij1234567890ABCD";
+    let content = format!(
+        "Deploy uses key {secret_token}\nOPENAI_API_KEY=sk-proj-DEADBEEFdeadbeef012345"
+    );
+
+    let entry = extracted_memory_entry(
+        MemoryCategory::Fact,
+        &content,
+        "session-xyz",
+        memory::TrustLevel::High,
+    );
+
+    assert!(
+        !entry.content.contains(secret_token),
+        "raw token leaked into memory: {}",
+        entry.content
+    );
+    assert!(
+        !entry.content.contains("sk-proj-DEADBEEFdeadbeef012345"),
+        "raw env-assignment value leaked into memory: {}",
+        entry.content
+    );
+    assert!(
+        entry.content.contains("[REDACTED_SECRET]"),
+        "expected redaction marker, got: {}",
+        entry.content
+    );
+    // category/source/trust are preserved as-is; only content is redacted.
+    assert_eq!(entry.category, MemoryCategory::Fact);
+    assert_eq!(entry.source.as_deref(), Some("session-xyz"));
+    assert_eq!(entry.trust, memory::TrustLevel::High);
+}
+
+#[test]
+fn extracted_memory_leaves_plain_content_unchanged() {
+    let content = "The build uses cargo profile selfdev and the tokio runtime.";
+    let entry = extracted_memory_entry(
+        MemoryCategory::Fact,
+        content,
+        "incremental",
+        memory::TrustLevel::Medium,
+    );
+    assert_eq!(entry.content, content);
+}
