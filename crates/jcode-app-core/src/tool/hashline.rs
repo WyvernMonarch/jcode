@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 pub struct HashlineTool;
 
 impl HashlineTool {
-    pub fn new() -> Box<dyn Tool> {
-        Box::new(Self)
+    pub fn new() -> Self {
+        Self
     }
 }
 
