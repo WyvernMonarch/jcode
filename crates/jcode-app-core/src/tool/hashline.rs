@@ -18,9 +18,10 @@ use std::sync::OnceLock;
 /// Max `N:content` rows emitted by a single `read` (mirrors the `read` tool cap).
 const MAX_READ_ROWS: usize = 5000;
 
-/// Process-global snapshot store shared across all `hashline` tool calls, so a
-/// `read` in one turn can back a stale-tag recovery in a later `apply`.
-fn store() -> &'static SnapshotStore {
+/// Process-global snapshot store shared across all `hashline` tool calls (and
+/// the main `read` tool when hashline tags are enabled), so a `read` in one turn
+/// can back a stale-tag recovery in a later `apply`.
+pub(crate) fn store() -> &'static SnapshotStore {
     static STORE: OnceLock<SnapshotStore> = OnceLock::new();
     STORE.get_or_init(SnapshotStore::new)
 }
