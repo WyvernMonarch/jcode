@@ -3474,6 +3474,7 @@ dependencies = [
  "jcode-render-core",
  "jcode-session-types",
  "jcode-side-panel-types",
+ "jcode-snapcompact",
  "jcode-storage",
  "jcode-task-types",
  "jcode-telemetry-core",
@@ -4113,7 +4114,12 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "fontdue",
+ "jcode-message-types",
  "png 0.17.16",
+ "regex",
+ "serde_json",
+ "unicode-normalization",
+ "unicode-properties",
 ]
 
 [[package]]
