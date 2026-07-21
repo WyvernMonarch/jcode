@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,10 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// True when the skill is user-invoked only (`disable-model-invocation` in
+    /// frontmatter): it must stay out of the model-facing prompt surfaces
+    /// (Available Skills list, BM25 hints) and fire only via explicit `/name`.
+    pub disable_model_invocation: bool,
     pub content: String,
     pub path: PathBuf,
     search_text: String,
@@ -25,6 +29,13 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<String>,
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
+    /// True when this skill was authored by the agent via `skill_manage`
+    /// (create/update). Only managed skills may be updated/deleted or safely
+    /// overwritten; hand-authored skills (no marker) are never clobbered.
+    #[serde(default)]
+    managed: bool,
 }
 
 /// Registry of available skills
@@ -239,11 +250,14 @@ impl SkillRegistry {
         // First-run import from Claude Code / Codex CLI
         Self::import_from_external();
 
+        let skills_cfg = crate::config::config().skills.clone();
         let mut registry = Self::default();
 
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
-        if let Some(plugins_root) = Self::claude_plugins_root() {
+        if skills_cfg.plugin_import
+            && let Some(plugins_root) = Self::claude_plugins_root()
+        {
             registry.load_plugin_skills_from_root(&plugins_root);
         }
 
@@ -262,7 +276,24 @@ impl SkillRegistry {
             registry.load_from_dir(&agents_skills)?;
         }
 
+        registry.apply_skills_config(&skills_cfg);
         Ok(registry)
+    }
+
+    /// Apply `[skills]` config filters: drop excluded skills, force
+    /// `user_invoked_only` matches out of model-facing surfaces.
+    fn apply_skills_config(&mut self, cfg: &crate::config::SkillsConfig) {
+        if !cfg.exclude.is_empty() {
+            self.skills
+                .retain(|name, _| !cfg.exclude.iter().any(|p| glob_match(p, name)));
+        }
+        if !cfg.user_invoked_only.is_empty() {
+            for (name, skill) in self.skills.iter_mut() {
+                if cfg.user_invoked_only.iter().any(|p| glob_match(p, name)) {
+                    skill.disable_model_invocation = true;
+                }
+            }
+        }
     }
 
     /// Load only the project-local skill overlay for a workspace root:
@@ -491,6 +522,8 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
+            ..
         } = frontmatter;
 
         let allowed_tools =
@@ -501,6 +534,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
             content: body,
             path: path.to_path_buf(),
             search_text,
@@ -591,19 +625,21 @@ impl SkillRegistry {
         );
         self.skills.clear();
 
-        let mut count = 0;
+        let skills_cfg = crate::config::config().skills.clone();
 
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
-        if let Some(plugins_root) = Self::claude_plugins_root() {
-            count += self.load_plugin_skills_from_root(&plugins_root);
+        if skills_cfg.plugin_import
+            && let Some(plugins_root) = Self::claude_plugins_root()
+        {
+            self.load_plugin_skills_from_root(&plugins_root);
         }
 
         // Load from ~/.jcode/skills/ (jcode's own global skills)
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let jcode_skills = jcode_dir.join("skills");
             if jcode_skills.exists() {
-                count += self.load_from_dir_count(&jcode_skills)?;
+                self.load_from_dir(&jcode_skills)?;
             }
         }
 
@@ -611,10 +647,11 @@ impl SkillRegistry {
         if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
             && agents_skills.exists()
         {
-            count += self.load_from_dir_count(&agents_skills)?;
+            self.load_from_dir(&agents_skills)?;
         }
 
-        Ok(count)
+        self.apply_skills_config(&skills_cfg);
+        Ok(self.skills.len())
     }
 
     /// Load skills from a directory and return count
@@ -882,6 +919,38 @@ pub fn endorsed_skills() -> &'static [EndorsedSkill] {
     ENDORSED_SKILLS
 }
 
+/// True if the SKILL.md at `path` was authored by the agent (`managed: true`
+/// in its YAML frontmatter). A missing/unparsable/unmarked file reads as false,
+/// so the create/update/delete paths never overwrite hand-authored skills.
+pub fn is_managed_skill_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| SkillRegistry::parse_frontmatter(&content).ok())
+        .map(|(frontmatter, _body)| frontmatter.managed)
+        .unwrap_or(false)
+}
+
+#[derive(Serialize)]
+struct ManagedFrontmatter<'a> {
+    name: &'a str,
+    description: &'a str,
+    managed: bool,
+}
+
+/// Render a managed SKILL.md document: YAML frontmatter (`name`, `description`,
+/// `managed: true`) followed by `body`. serde_yaml quotes values as needed so
+/// descriptions containing YAML-special characters round-trip through
+/// [`SkillRegistry::parse_frontmatter`].
+pub fn managed_skill_document(name: &str, description: &str, body: &str) -> String {
+    let frontmatter = serde_yaml::to_string(&ManagedFrontmatter {
+        name,
+        description,
+        managed: true,
+    })
+    .unwrap_or_else(|_| format!("name: {name}\ndescription: {description}\nmanaged: true\n"));
+    format!("---\n{}---\n\n{}\n", frontmatter, body.trim_end_matches('\n'))
+}
+
 impl Skill {
     /// Get the full prompt content for this skill
     pub fn get_prompt(&self) -> String {
@@ -889,6 +958,12 @@ impl Skill {
             "# Skill: {}\n\n{}\n\n{}",
             self.name, self.description, self.content
         )
+    }
+
+    /// Normalized search text (name + description + body) used for BM25
+    /// auto-suggestion. Built once at parse time; see [`skill_match`].
+    pub fn search_text(&self) -> &str {
+        &self.search_text
     }
 
     /// Load additional files from the skill directory
@@ -926,7 +1001,37 @@ fn build_skill_search_text(name: &str, description: &str, content: &str) -> Stri
     normalize_skill_search_text(&format!("{}\n{}\n{}", name, description, content))
 }
 
-fn normalize_skill_search_text(text: &str) -> String {
+/// Match a skill name against a `[skills]` config pattern: literal match with
+/// `*` as a multi-char wildcard (`figma-*`, `*-review`, `to-*`).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let mut pos = 0;
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !name.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == last {
+            return name.len() >= pos + part.len() && name[pos..].ends_with(part);
+        } else {
+            match name[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn normalize_skill_search_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
         .map(|c| {
@@ -951,10 +1056,71 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            disable_model_invocation: false,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: build_skill_search_text(name, description, content),
         }
+    }
+
+    #[test]
+    fn glob_match_covers_literal_prefix_suffix_and_middle() {
+        assert!(glob_match("herdr", "herdr"));
+        assert!(!glob_match("herdr", "herdr2"));
+        assert!(glob_match("figma-*", "figma-use"));
+        assert!(!glob_match("figma-*", "figma"));
+        assert!(glob_match("*-review", "ponytail-review"));
+        assert!(!glob_match("*-review", "review"));
+        assert!(glob_match("to-*-x", "to-prd-x"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn skills_config_filters_exclude_and_force_user_invoked() {
+        let mut registry = SkillRegistry::default();
+        for name in ["figma-use", "figma-swiftui", "ponytail", "herdr"] {
+            let skill = test_skill(name, "desc", "body");
+            registry.skills.insert(skill.name.clone(), skill);
+        }
+        let cfg = crate::config::SkillsConfig {
+            plugin_import: true,
+            exclude: vec!["figma-*".to_string()],
+            user_invoked_only: vec!["ponytail".to_string()],
+        };
+        registry.apply_skills_config(&cfg);
+
+        assert!(!registry.contains("figma-use"), "excluded by glob");
+        assert!(!registry.contains("figma-swiftui"), "excluded by glob");
+        assert!(
+            registry.get("ponytail").unwrap().disable_model_invocation,
+            "forced user-invoked-only"
+        );
+        assert!(!registry.get("herdr").unwrap().disable_model_invocation);
+    }
+
+    #[test]
+    fn parse_skill_reads_disable_model_invocation_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("user-only");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: user-only\ndescription: Manual-only skill\ndisable-model-invocation: true\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+        let skill = SkillRegistry::parse_skill(&dir.join("SKILL.md")).expect("parse");
+        assert!(skill.disable_model_invocation);
+
+        // Absent flag defaults to false (model-invocable).
+        let dir2 = temp.path().join("normal");
+        std::fs::create_dir_all(&dir2).expect("create dir");
+        std::fs::write(
+            dir2.join("SKILL.md"),
+            "---\nname: normal\ndescription: Normal skill\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+        let skill = SkillRegistry::parse_skill(&dir2.join("SKILL.md")).expect("parse");
+        assert!(!skill.disable_model_invocation);
     }
 
     fn write_test_skill(root: &Path, scope: &str, name: &str) {

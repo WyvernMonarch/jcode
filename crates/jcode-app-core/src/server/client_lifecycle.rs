@@ -1854,6 +1854,17 @@ pub(super) async fn handle_client(
                 .await;
             }
 
+            Request::ReloadSkills { id } => {
+                let count = {
+                    let registry = crate::skill::SkillRegistry::shared_registry();
+                    let mut skills = registry.write().await;
+                    skills.reload_global().unwrap_or(0)
+                };
+                crate::logging::info(&format!(
+                    "reload_skills (request {id}): global registry reloaded, {count} skills"
+                ));
+            }
+
             Request::Split { id } => {
                 handle_split(id, &client_session_id, &client_event_tx).await;
             }

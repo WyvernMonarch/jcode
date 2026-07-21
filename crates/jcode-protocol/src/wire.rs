@@ -280,6 +280,12 @@ pub enum Request {
         enabled: bool,
     },
 
+    /// Reload the server's global skill registry from disk + `[skills]` config.
+    /// Sent after a client-side config edit (e.g. the /skills-setup picker) so
+    /// fresh sessions see the new skill set without a server restart.
+    #[serde(rename = "reload_skills")]
+    ReloadSkills { id: u64 },
+
     /// Set the compaction mode for this session
     #[serde(rename = "set_compaction_mode")]
     SetCompactionMode {

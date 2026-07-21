@@ -396,6 +396,16 @@ pub(super) async fn handle_terminal_event(
                         }
                     }
                 }
+                if app.pending_skills_reload {
+                    app.pending_skills_reload = false;
+                    if let Err(error) = remote.reload_skills().await {
+                        app.push_display_message(DisplayMessage::error(format!(
+                            "Failed to request skill reload: {} — new sessions will pick the \
+                             config up after a server restart.",
+                            error
+                        )));
+                    }
+                }
                 if let Some(selection) = app.pending_account_picker_action.take() {
                     match selection {
                         crate::tui::AccountPickerAction::Switch { provider_id, label } => {

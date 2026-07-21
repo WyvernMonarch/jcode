@@ -1741,6 +1741,21 @@ fn build_skills_report(app: &App) -> String {
 }
 
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/skills-setup" {
+        if app.local_transcript_message_count() != 0 {
+            app.push_display_message(DisplayMessage::error(
+                "/skills-setup only works in a fresh session (0 messages): the skill list is \
+                 baked into the cached system-prompt prefix once the conversation starts. \
+                 Run /clear first, or start a new session."
+                    .to_string(),
+            ));
+            app.set_status_notice("Skills setup: fresh sessions only");
+            return true;
+        }
+        app.open_skills_setup_picker();
+        return true;
+    }
+
     if trimmed == "/skills" {
         // Sync from disk first so skills added by agent-side `skill_manage
         // reload_all` (which only updates the server process registry) show up

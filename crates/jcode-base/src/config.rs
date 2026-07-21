@@ -456,6 +456,9 @@ pub struct Config {
     /// Built-in tool exposure configuration
     pub tools: ToolConfig,
 
+    /// Skill loading / prompt-surface configuration
+    pub skills: SkillsConfig,
+
     /// Agent Client Protocol adapter configuration
     pub acp: AcpConfig,
 
@@ -529,6 +532,36 @@ impl Default for AcpConfig {
         Self {
             profile: "standard".to_string(),
             tool_profile: "acp".to_string(),
+        }
+    }
+}
+
+/// Controls which skills load and how they surface to the model.
+///
+/// Applies to GLOBAL skill sources only (Claude Code plugins, `~/.jcode/skills`,
+/// `~/.agents/skills`). Project-local overlays (`./.jcode/skills` etc.) are
+/// already curated per-repo and load unfiltered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Load skills shipped by Claude Code plugins (`~/.claude/plugins`).
+    /// Set false to keep plugin skills (figma-*, etc.) out of jcode entirely.
+    pub plugin_import: bool,
+    /// Glob patterns (`figma-*`, `to-prd`) of skills to skip at load time:
+    /// not in the prompt, not slash-invocable, invisible to jcode.
+    pub exclude: Vec<String>,
+    /// Glob patterns of skills forced to user-invoked-only: still loadable
+    /// via `/name`, but never listed in the system prompt or BM25 hints —
+    /// as if their SKILL.md set `disable-model-invocation: true`.
+    pub user_invoked_only: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            plugin_import: true,
+            exclude: Vec::new(),
+            user_invoked_only: Vec::new(),
         }
     }
 }
