@@ -104,7 +104,36 @@ Requires a vision-capable **current** model (checked via
 non-vision models silently fall back to the normal summary path, so enabling
 globally is safe.
 
-### 6. `fix/config-env-keys`
+### 6. Tool control — `/tools-setup` + per-family routing (`feat/tool-control`)
+
+Stacked on `feat/skills` (reuses the checkbox-picker infrastructure).
+
+**`/tools-setup`** — interactive checkbox picker over every registered tool
+(name + first description line): `↵` toggles, `Esc` saves unchecked tools into
+`[tools].disabled` and restarts the (empty) session so the rebuilt Agent
+re-reads the config. Gated to sessions with **0 messages** — the tool list is
+locked per session for prompt-cache stability.
+
+**`[tools.families]`** — per-model-family tool routing. Keys are
+case-insensitive substrings matched against the active model id; matching
+entries' `disabled` lists are subtracted from the tool set when the list locks
+(first turn). No families ship by default — pure config:
+
+```toml
+[tools.families.gpt]
+disabled = ["edit", "multiedit", "patch"]   # codex models patch via apply_patch
+[tools.families.claude]
+disabled = ["apply_patch", "patch"]         # claude models edit via str_replace
+[tools.families.glm]
+disabled = ["apply_patch", "patch"]
+```
+
+Rationale: upstream sends all 5 editing tools (~16.5k tokens of schemas for 34
+tools) to every model; opencode ships the same idea hardcoded
+(`registry.ts`: GPT-5 → apply_patch, everyone else → edit+write). A
+mid-session model switch keeps the locked list — cache stability wins.
+
+### 7. `fix/config-env-keys`
 
 One-liner: `JCODE_TOOL_CALL_DETAILS` added to `CONFIG_ENV_KEYS` — the env
 fingerprint test was red on upstream master. Prime upstream-PR candidate.
@@ -121,6 +150,7 @@ feat/skills                │  each compiles standalone
 feat/memory-redaction      │  off master
 feat/worktree-isolation    │
 feat/snapcompact           ┘
+feat/tool-control          stacked on feat/skills (shares the picker infra)
 omp-merge                  integration = master + merge of all of the above + docs
 ```
 
