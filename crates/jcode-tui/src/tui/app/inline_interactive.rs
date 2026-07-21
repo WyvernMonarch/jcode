@@ -2212,6 +2212,133 @@ impl App {
         }
     }
 
+    /// Open the /tools-setup checkbox picker: every registered tool with an
+    /// on/off state seeded from `[tools].disabled`. Only meaningful before the
+    /// session has messages — the caller enforces the 0-message gate.
+    pub(super) fn open_tools_setup_picker(&mut self) {
+        let Some(summaries) = self.registry.try_tool_summaries() else {
+            self.push_display_message(DisplayMessage::error(
+                "Tool registry is busy; try /tools-setup again.".to_string(),
+            ));
+            return;
+        };
+        let cfg = crate::config::Config::load();
+        let disabled: std::collections::BTreeSet<String> =
+            cfg.tools.disabled.iter().cloned().collect();
+
+        let mut rows: Vec<(String, String, bool)> = summaries
+            .into_iter()
+            .map(|(name, desc)| {
+                let enabled = !disabled.contains(&name);
+                (name, desc, enabled)
+            })
+            .collect();
+        for name in &disabled {
+            if !rows.iter().any(|(n, _, _)| n == name) {
+                rows.push((name.clone(), "(not registered)".to_string(), false));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if rows.is_empty() {
+            self.push_display_message(DisplayMessage::system(
+                "No tools found to configure.".to_string(),
+            ));
+            return;
+        }
+
+        let entries: Vec<PickerEntry> = rows
+            .into_iter()
+            .map(|(name, description, enabled)| PickerEntry {
+                name: name.clone(),
+                options: vec![PickerOption {
+                    provider: skill_toggle_state_label(enabled),
+                    api_method: truncate_skill_description(&description),
+                    available: true,
+                    detail: String::new(),
+                    estimated_reference_cost_micros: None,
+                }],
+                action: PickerAction::ToolToggle { name },
+                selected_option: 0,
+                is_current: enabled,
+                is_default: false,
+                is_favorite: false,
+                recommended: false,
+                recommendation_rank: usize::MAX,
+                usage_score: 0,
+                old: false,
+                created_date: None,
+                effort: None,
+            })
+            .collect();
+
+        let filtered = (0..entries.len()).collect();
+        self.inline_interactive_state = Some(InlineInteractiveState {
+            kind: PickerKind::Tools,
+            entries,
+            filtered,
+            selected: 0,
+            column: 0,
+            filter: String::new(),
+            preview: false,
+        });
+        self.set_status_notice("Tools setup: ↵ toggle · Esc save");
+    }
+
+    /// Commit the /tools-setup picker: rewrite `[tools].disabled` and reset the
+    /// (empty) session so the fresh Agent picks up the new tool selection.
+    pub(super) fn finish_tools_setup(&mut self) {
+        let Some(picker) = self.inline_interactive_state.take() else {
+            return;
+        };
+        let shown: std::collections::BTreeSet<String> =
+            picker.entries.iter().map(|e| e.name.clone()).collect();
+        let disabled: Vec<String> = picker
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_current)
+            .map(|entry| entry.name.clone())
+            .collect();
+
+        let cfg = crate::config::Config::load();
+        let mut merged: Vec<String> = cfg
+            .tools
+            .disabled
+            .iter()
+            .filter(|name| !shown.contains(*name))
+            .cloned()
+            .collect();
+        merged.extend(disabled.iter().cloned());
+        merged.sort();
+        merged.dedup();
+
+        match crate::config::Config::set_tools_disabled(merged) {
+            Ok(()) => {
+                let summary = if disabled.is_empty() {
+                    "all tools enabled".to_string()
+                } else {
+                    format!("disabled: {}", disabled.join(", "))
+                };
+                if self.is_remote {
+                    // Server rebuilds the Agent (and re-reads [tools]) on Clear.
+                    self.pending_tools_reset = true;
+                } else {
+                    super::commands_review::reset_current_session(self);
+                }
+                self.push_display_message(DisplayMessage::system(format!(
+                    "Tools setup saved ({summary}). Session restarted with the new tool set."
+                )));
+                self.set_status_notice("Tools setup saved");
+            }
+            Err(error) => {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Failed to save tools setup: {error}"
+                )));
+                self.set_status_notice("Tools setup save failed");
+            }
+        }
+    }
+
     pub(super) fn open_session_picker(&mut self) {
         let current_dir = self.session.working_dir.clone();
         let (mut picker, status) = if let Some((server_groups, orphan_sessions)) =
@@ -3028,13 +3155,20 @@ impl App {
                     Self::apply_inline_interactive_filter(picker);
                     return Ok(());
                 }
-                if self
+                match self
                     .inline_interactive_state
                     .as_ref()
-                    .is_some_and(|picker| picker.kind == PickerKind::Skills)
+                    .map(|picker| picker.kind)
                 {
-                    self.finish_skills_setup();
-                    return Ok(());
+                    Some(PickerKind::Skills) => {
+                        self.finish_skills_setup();
+                        return Ok(());
+                    }
+                    Some(PickerKind::Tools) => {
+                        self.finish_tools_setup();
+                        return Ok(());
+                    }
+                    _ => {}
                 }
                 self.inline_interactive_state = None;
             }
@@ -3249,7 +3383,7 @@ impl App {
                 }
 
                 match entry.action {
-                    PickerAction::SkillToggle { name } => {
+                    PickerAction::SkillToggle { name } | PickerAction::ToolToggle { name } => {
                         if let Some(ref mut picker) = self.inline_interactive_state
                             && let Some(entry) = picker.entries.get_mut(idx)
                         {

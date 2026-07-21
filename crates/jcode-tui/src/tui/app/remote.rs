@@ -396,6 +396,31 @@ pub(super) async fn handle_terminal_event(
                         }
                     }
                 }
+                if app.pending_tools_reset {
+                    app.pending_tools_reset = false;
+                    match remote.clear().await {
+                        Ok(_) => {
+                            app.clear_provider_messages();
+                            app.clear_display_messages();
+                            app.queued_messages.clear();
+                            app.pasted_contents.clear();
+                            app.pending_images.clear();
+                            app.clear_streaming_render_state();
+                            app.clear_live_usage_state();
+                            crate::tui::mermaid::clear_active_diagrams();
+                            app.is_processing = false;
+                            app.status = ProcessingStatus::Idle;
+                            app.set_status_notice("Session restarted with new tool set");
+                        }
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(format!(
+                                "Failed to restart session for new tool set: {} — \
+                                 run /clear manually.",
+                                error
+                            )));
+                        }
+                    }
+                }
                 if app.pending_skills_reload {
                     app.pending_skills_reload = false;
                     if let Err(error) = remote.reload_skills().await {

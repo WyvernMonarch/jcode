@@ -353,6 +353,22 @@ impl Registry {
         tools.keys().cloned().collect()
     }
 
+    /// Sync snapshot of registered tools as (name, first description line),
+    /// sorted by name. `None` when the registry lock is contended — callers
+    /// (TUI pickers) should retry or report rather than block.
+    pub fn try_tool_summaries(&self) -> Option<Vec<(String, String)>> {
+        let tools = self.tools.try_read().ok()?;
+        let mut out: Vec<(String, String)> = tools
+            .iter()
+            .map(|(name, tool)| {
+                let desc = tool.description().lines().next().unwrap_or("").to_string();
+                (name.clone(), desc)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
+    }
+
     /// Enable test mode for memory tools (isolated storage)
     /// Called when session is marked as debug
     pub async fn enable_memory_test_mode(&self) {

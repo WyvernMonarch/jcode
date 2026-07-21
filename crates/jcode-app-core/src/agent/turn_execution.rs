@@ -393,11 +393,21 @@ impl Agent {
     }
 
     /// Build the agent's tool definitions from the registry, applying the
-    /// session's `allowed_tools`, `disabled_tools`, and self-dev filters.
+    /// session's `allowed_tools`, `disabled_tools`, per-model-family overrides
+    /// (`[tools.families]`), and self-dev filters.
     async fn build_filtered_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
         if !self.disabled_tools.is_empty() {
             tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
+        }
+        // Family overrides resolve against the model active when the tool list
+        // locks (first turn); a later mid-session model switch keeps the locked
+        // list — cache stability wins over re-tailoring.
+        let family_disabled = crate::config::config()
+            .tools
+            .family_disabled_for(&self.provider.model());
+        if !family_disabled.is_empty() {
+            tools.retain(|tool| !family_disabled.contains(&tool.name));
         }
         Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
         tools

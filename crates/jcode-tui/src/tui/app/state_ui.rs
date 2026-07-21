@@ -1741,6 +1741,20 @@ fn build_skills_report(app: &App) -> String {
 }
 
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/tools-setup" {
+        if app.local_transcript_message_count() != 0 {
+            app.push_display_message(DisplayMessage::error(
+                "/tools-setup only works in a fresh session (0 messages): the tool list is \
+                 locked per session for prompt-cache stability. Run /clear first."
+                    .to_string(),
+            ));
+            app.set_status_notice("Tools setup: fresh sessions only");
+            return true;
+        }
+        app.open_tools_setup_picker();
+        return true;
+    }
+
     if trimmed == "/skills-setup" {
         if app.local_transcript_message_count() != 0 {
             app.push_display_message(DisplayMessage::error(

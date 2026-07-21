@@ -823,6 +823,10 @@ pub enum PickerKind {
     /// on/off, Esc saves the exclusions to `[skills]` config. Only offered in
     /// sessions with zero messages.
     Skills,
+    /// Startup tools checkbox list (/tools-setup): Enter toggles a tool
+    /// on/off, Esc saves [tools].disabled and resets the (empty) session so
+    /// the new tool set applies. Only offered in sessions with zero messages.
+    Tools,
 }
 
 /// What the first-run onboarding welcome screen should render in its body,
@@ -998,6 +1002,17 @@ impl PickerKind {
                 shows_default_shortcut_hint: false,
                 preview_activation_column: 2,
             },
+            Self::Tools => InlineInteractiveSchema {
+                layout: InlineInteractiveLayout::Compact,
+                primary_label: "TOOL",
+                secondary_label: "STATE",
+                secondary_preview_label: "STATE",
+                tertiary_label: "",
+                preview_submit_hint: "  \u{21b5} toggle",
+                active_submit_hint: "  \u{2191}\u{2193}/jk \u{21b5} toggle \u{b7} Esc save",
+                shows_default_shortcut_hint: false,
+                preview_activation_column: 0,
+            },
             Self::Skills => InlineInteractiveSchema {
                 layout: InlineInteractiveLayout::Compact,
                 primary_label: "SKILL",
@@ -1063,7 +1078,7 @@ impl PickerKind {
                 let detail = route.map(|option| option.detail.as_str()).unwrap_or("");
                 format!("{} {} {} {}", entry.name, provider, method, detail)
             }
-            Self::Skills => {
+            Self::Skills | Self::Tools => {
                 let state = entry
                     .active_option()
                     .map(|option| option.provider.as_str())
@@ -1096,6 +1111,8 @@ pub enum PickerAction {
     Model,
     /// Toggle a skill on/off in the /skills-setup checkbox picker.
     SkillToggle { name: String },
+    /// Toggle a tool on/off in the /tools-setup checkbox picker.
+    ToolToggle { name: String },
     Account(AccountPickerAction),
     Login(crate::provider_catalog::LoginProviderDescriptor),
     Logout(crate::provider_catalog::LoginProviderDescriptor),
@@ -1155,7 +1172,7 @@ fn estimate_picker_action_bytes(action: &PickerAction) -> usize {
         | PickerAction::AgentTarget(_)
         | PickerAction::AgentModelChoice { .. }
         | PickerAction::LogoutAll => 0,
-        PickerAction::SkillToggle { name } => name.capacity(),
+        PickerAction::SkillToggle { name } | PickerAction::ToolToggle { name } => name.capacity(),
         PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => {
             provider_id.capacity() + label.capacity()
         }

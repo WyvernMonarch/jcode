@@ -321,6 +321,33 @@ fn tool_config_defaults_to_full_toolset() {
 }
 
 #[test]
+fn tool_config_family_overrides_match_model_substring() {
+    let mut cfg = ToolConfig::default();
+    cfg.families.insert(
+        "gpt".to_string(),
+        crate::config::FamilyToolOverride {
+            disabled: vec!["edit".to_string(), "multiedit".to_string()],
+        },
+    );
+    cfg.families.insert(
+        "claude".to_string(),
+        crate::config::FamilyToolOverride {
+            disabled: vec!["apply_patch".to_string()],
+        },
+    );
+
+    let gpt = cfg.family_disabled_for("gpt-5.6-luna");
+    assert!(gpt.contains("edit") && gpt.contains("multiedit"));
+    assert!(!gpt.contains("apply_patch"));
+
+    let claude = cfg.family_disabled_for("claude-opus-4-8");
+    assert_eq!(claude.len(), 1);
+    assert!(claude.contains("apply_patch"));
+
+    assert!(cfg.family_disabled_for("glm-5.2").is_empty());
+}
+
+#[test]
 fn tool_config_explicit_enabled_uses_allow_list() {
     let cfg = ToolConfig {
         enabled: vec!["gmail".to_string()],

@@ -584,6 +584,23 @@ pub struct ToolConfig {
     /// records a whole-file snapshot so `hashline apply` can recover from a
     /// stale tag after a plain read. Off by default (zero behavior change).
     pub read_hashline_tags: bool,
+    /// Per-model-family tool overrides. Keys are case-insensitive substrings
+    /// matched against the active model id; every matching entry's `disabled`
+    /// list is subtracted from the tool set for that session.
+    ///
+    /// [tools.families.gpt]
+    /// disabled = ["edit", "multiedit"]      # codex models patch via apply_patch
+    /// [tools.families.claude]
+    /// disabled = ["apply_patch", "patch"]   # claude models edit via str_replace
+    pub families: BTreeMap<String, FamilyToolOverride>,
+}
+
+/// Tool overrides for one model family (`[tools.families.<pattern>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FamilyToolOverride {
+    /// Tools removed for models matching the family pattern.
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -696,6 +713,22 @@ impl ToolConfig {
         }
 
         (enabled, enables_all_tools)
+    }
+
+    /// Tools disabled for `model_id` by `[tools.families]`: the union of every
+    /// entry whose key occurs (case-insensitive) in the model id.
+    pub fn family_disabled_for(&self, model_id: &str) -> HashSet<String> {
+        let model = model_id.to_ascii_lowercase();
+        self.families
+            .iter()
+            .filter(|(pattern, _)| {
+                let p = pattern.trim().to_ascii_lowercase();
+                !p.is_empty() && model.contains(&p)
+            })
+            .flat_map(|(_, family)| family.disabled.iter())
+            .map(|name| normalize_tool_name(name))
+            .filter(|name| !name.is_empty())
+            .collect()
     }
 }
 

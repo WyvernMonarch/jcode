@@ -122,6 +122,14 @@ impl Config {
         Ok(())
     }
 
+    /// Replace the `[tools].disabled` list in the config file.
+    pub fn set_tools_disabled(disabled: Vec<String>) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.tools.disabled = disabled;
+        cfg.save()?;
+        Ok(())
+    }
+
     /// Update the persisted OpenAI reasoning effort preference.
     pub fn set_openai_reasoning_effort(value: Option<&str>) -> anyhow::Result<()> {
         let mut cfg = Self::load();
