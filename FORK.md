@@ -133,7 +133,42 @@ tools) to every model; opencode ships the same idea hardcoded
 (`registry.ts`: GPT-5 → apply_patch, everyone else → edit+write). A
 mid-session model switch keeps the locked list — cache stability wins.
 
-### 7. `fix/config-env-keys`
+### 7. Custom swarm agents — `[swarm.roles]` / `[swarm.categories]` (`feat/swarm-roles`)
+
+Config-defined swarm agents, no hardcoded roster (idea ported from
+oh-my-opencode's agents/categories system). Stacked on
+`feat/worktree-isolation`.
+
+```toml
+[swarm.categories.quick]          # semantic work-kind
+description = "Fast cheap tasks"
+model = "glm-5-turbo"
+effort = "low"
+prompt_append = "Work fast, keep answers short."
+
+[swarm.roles.reviewer]            # named custom agent
+description = "Read-only reviewer"
+category = "quick"                # inherits model/effort/append; role wins
+prompt_append = "Max 3 blockers, approval bias."
+disabled_tools = ["write", "edit"]
+skills = ["some-skill"]           # full skill bodies injected into the task
+isolated = true                   # default worktree isolation
+```
+
+Spawn with `swarm {action:"spawn", agent:"reviewer", ...}` or
+`category:"quick"`. Resolution: category → role → explicit spawn args
+(model/effort/isolated always win). `prompt_append`s concatenate under a
+`## Role guidance` section in the member's startup message; tool
+restrictions apply via the member agent (headless/inline) or
+`JCODE_DISABLED_TOOLS` env (visible spawns), merged with global
+`[tools].disabled`. The configured roster renders live into the swarm tool
+description; unknown names fail listing what exists. The description is
+baked at first registry init — restart the server after editing roles.
+
+Verified live (glm-5-turbo, isolated server): model/effort resolved from
+category, guidance obeyed, write/edit absent from the member's toolset.
+
+### 8. `fix/config-env-keys`
 
 One-liner: `JCODE_TOOL_CALL_DETAILS` added to `CONFIG_ENV_KEYS` — the env
 fingerprint test was red on upstream master. Prime upstream-PR candidate.
@@ -151,6 +186,7 @@ feat/memory-redaction      │  off master
 feat/worktree-isolation    │
 feat/snapcompact           ┘
 feat/tool-control          stacked on feat/skills (shares the picker infra)
+feat/swarm-roles           stacked on feat/worktree-isolation (spawn path)
 omp-merge                  integration = master + merge of all of the above + docs
 ```
 
