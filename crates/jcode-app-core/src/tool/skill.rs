@@ -30,14 +30,22 @@ impl SkillTool {
 
 #[derive(Deserialize)]
 struct SkillInput {
-    /// Action to perform: load (default), list, reload, reload_all, read.
-    /// `list` shows both loaded skills and the jcode-endorsed catalog.
+    /// Action to perform: load (default), list, reload, reload_all, read,
+    /// create, update, delete. `list` shows both loaded skills and the
+    /// jcode-endorsed catalog. `create`/`update`/`delete` manage agent-authored
+    /// skills under ~/.jcode/skills.
     #[serde(default = "default_action")]
     action: String,
-    /// Skill name (required for load, reload, read)
+    /// Skill name (required for load, reload, read, create, update, delete)
     #[serde(alias = "skill")]
     #[serde(default)]
     name: Option<String>,
+    /// One-line description (required for create/update).
+    #[serde(default)]
+    description: Option<String>,
+    /// Skill body/instructions in Markdown (required for create/update).
+    #[serde(default)]
+    body: Option<String>,
     /// Optional Claude-compatible Skill wrapper argument. The skill loader only
     /// needs to load the prompt, so args are currently accepted and ignored.
     #[serde(default)]
@@ -65,12 +73,20 @@ impl Tool for SkillTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["load", "list", "reload", "reload_all", "read"],
+                    "enum": ["load", "list", "reload", "reload_all", "read", "create", "update", "delete"],
                     "description": "Action."
                 },
                 "name": {
                     "type": "string",
                     "description": "Skill name."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One-line skill description (required for create/update)."
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Skill body/instructions in Markdown (required for create/update)."
                 }
             }
         })
@@ -94,8 +110,22 @@ impl Tool for SkillTool {
                 self.read_skill(params.name, ctx.working_dir.as_deref())
                     .await
             }
+            "create" => {
+                self.create_skill(
+                    params.name,
+                    params.description,
+                    params.body,
+                    ctx.working_dir.as_deref(),
+                )
+                .await
+            }
+            "update" => {
+                self.update_skill(params.name, params.description, params.body)
+                    .await
+            }
+            "delete" => self.delete_skill(params.name).await,
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', or 'read'.",
+                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', 'create', 'update', or 'delete'.",
                 params.action
             ))),
         }
@@ -307,6 +337,147 @@ impl SkillTool {
             .with_title("Skills: Not found"))
         }
     }
+
+    /// Managed skills live under the global `~/.jcode/skills/<name>/SKILL.md`.
+    fn managed_skill_file(name: &str) -> Result<std::path::PathBuf> {
+        Ok(crate::storage::jcode_dir()?
+            .join("skills")
+            .join(name)
+            .join("SKILL.md"))
+    }
+
+    /// Reload the shared global registry after a create/update/delete so the
+    /// change is immediately loadable (same reload as `reload_all`).
+    async fn reload_registry_after_mutation(&self) {
+        let mut registry = self.registry.write().await;
+        if let Err(e) = registry.reload_global() {
+            crate::logging::warn(&format!(
+                "[tool:skill_manage] post-mutation reload failed error={}",
+                e
+            ));
+        }
+    }
+
+    async fn create_skill(
+        &self,
+        name: Option<String>,
+        description: Option<String>,
+        body: Option<String>,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<ToolOutput> {
+        let name = validate_managed_skill_name(name, "create")?;
+        let description = require_field(description, "description", "create")?;
+        let body = require_field(body, "body", "create")?;
+        let managed_file = Self::managed_skill_file(&name)?;
+
+        // Refuse to clobber a skill already loaded from a different source, or a
+        // hand-authored (non-managed) skill at the managed path.
+        let registry = self.effective_registry(working_dir).await;
+        if let Some(existing) = registry.get(&name) {
+            if existing.path != managed_file {
+                anyhow::bail!(
+                    "A skill named '{}' is already loaded from {}. Pick a different name, or remove that skill first.",
+                    name,
+                    existing.path.display()
+                );
+            }
+            if !crate::skill::is_managed_skill_file(&existing.path) {
+                anyhow::bail!(
+                    "A non-managed skill '{}' already exists at {}; refusing to overwrite a hand-authored skill.",
+                    name,
+                    existing.path.display()
+                );
+            }
+            anyhow::bail!(
+                "Managed skill '{}' already exists. Use action=update to change it.",
+                name
+            );
+        }
+        // Guard against an on-disk file not yet loaded into the registry.
+        if managed_file.exists() && !crate::skill::is_managed_skill_file(&managed_file) {
+            anyhow::bail!(
+                "A non-managed skill file already exists at {}; refusing to overwrite it.",
+                managed_file.display()
+            );
+        }
+
+        if let Some(dir) = managed_file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(
+            &managed_file,
+            crate::skill::managed_skill_document(&name, &description, &body),
+        )?;
+        self.reload_registry_after_mutation().await;
+
+        Ok(ToolOutput::new(format!(
+            "Created managed skill '{}' at {}.\nIt is now loadable with skill_manage (action=load).",
+            name,
+            managed_file.display()
+        ))
+        .with_title(format!("Skills: Created {}", name)))
+    }
+
+    async fn update_skill(
+        &self,
+        name: Option<String>,
+        description: Option<String>,
+        body: Option<String>,
+    ) -> Result<ToolOutput> {
+        let name = validate_managed_skill_name(name, "update")?;
+        let description = require_field(description, "description", "update")?;
+        let body = require_field(body, "body", "update")?;
+        let managed_file = Self::managed_skill_file(&name)?;
+
+        if !managed_file.exists() {
+            anyhow::bail!(
+                "No managed skill '{}' to update. Create it first with action=create.",
+                name
+            );
+        }
+        if !crate::skill::is_managed_skill_file(&managed_file) {
+            anyhow::bail!(
+                "Skill '{}' is not managed (missing 'managed: true'); refusing to modify a hand-authored skill.",
+                name
+            );
+        }
+
+        std::fs::write(
+            &managed_file,
+            crate::skill::managed_skill_document(&name, &description, &body),
+        )?;
+        self.reload_registry_after_mutation().await;
+
+        Ok(
+            ToolOutput::new(format!("Updated managed skill '{}'.", name))
+                .with_title(format!("Skills: Updated {}", name)),
+        )
+    }
+
+    async fn delete_skill(&self, name: Option<String>) -> Result<ToolOutput> {
+        let name = validate_managed_skill_name(name, "delete")?;
+        let managed_file = Self::managed_skill_file(&name)?;
+
+        if !managed_file.exists() {
+            anyhow::bail!("No managed skill '{}' to delete.", name);
+        }
+        if !crate::skill::is_managed_skill_file(&managed_file) {
+            anyhow::bail!(
+                "Skill '{}' is not managed; refusing to delete a hand-authored skill.",
+                name
+            );
+        }
+
+        // Remove the whole `<name>/` skill directory, not just SKILL.md.
+        let skill_dir = managed_file.parent().unwrap_or(&managed_file);
+        std::fs::remove_dir_all(skill_dir)?;
+        self.reload_registry_after_mutation().await;
+
+        Ok(
+            ToolOutput::new(format!("Deleted managed skill '{}'.", name))
+                .with_title(format!("Skills: Deleted {}", name)),
+        )
+    }
 }
 
 /// Append the curated jcode-endorsed skill catalog to `output`, grouped by
@@ -371,6 +542,32 @@ fn normalize_skill_name(name: Option<String>, action: &str) -> Result<String> {
         anyhow::bail!("'name' is required for {} action", action);
     }
     Ok(trimmed)
+}
+
+/// Validate a skill name that will become a directory under ~/.jcode/skills.
+/// The allowlist (letters, digits, '-', '_') rejects path separators, '..',
+/// and leading dots, so a managed name can never escape the skills root.
+fn validate_managed_skill_name(name: Option<String>, action: &str) -> Result<String> {
+    let name = normalize_skill_name(name, action)?;
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        anyhow::bail!(
+            "Invalid skill name '{}'. Use letters, digits, '-' or '_' only.",
+            name
+        );
+    }
+    Ok(name)
+}
+
+fn require_field(value: Option<String>, field: &str, action: &str) -> Result<String> {
+    let value =
+        value.ok_or_else(|| anyhow::anyhow!("'{}' is required for {} action", field, action))?;
+    if value.trim().is_empty() {
+        anyhow::bail!("'{}' must not be empty for {} action", field, action);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -645,5 +842,264 @@ mod tests {
             "skill edits must be visible without daemon restart, got: {}",
             read.output
         );
+    }
+
+    // --- Agent-authored (managed) skills: create / update / delete ------------
+    //
+    // These write into the global ~/.jcode/skills root, so they isolate it via
+    // JCODE_HOME under the shared test-env lock (same pattern as goal_tests).
+
+    fn write_unmanaged_global_skill(home: &std::path::Path, name: &str) {
+        let dir = home.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Hand authored\n---\n\nBody."),
+        )
+        .unwrap();
+    }
+
+    fn restore_home(prev_home: Option<std::ffi::OsString>) {
+        match prev_home {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_writes_managed_skill_and_makes_it_loadable() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let tool = create_test_tool();
+        let result = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "my-skill",
+                    "description": "Do a specific managed thing",
+                    "body": "# Managed\n\nSteps here.",
+                }),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("Created managed skill 'my-skill'"),
+            "got: {}",
+            result.output
+        );
+
+        // File written with the managed marker and the body.
+        let content =
+            std::fs::read_to_string(temp.path().join("skills/my-skill/SKILL.md")).unwrap();
+        assert!(
+            content.contains("managed: true"),
+            "frontmatter must mark managed: {content}"
+        );
+        assert!(content.contains("Steps here."));
+
+        // The post-mutation reload makes it immediately loadable.
+        let loaded = tool
+            .execute(
+                json!({"action": "load", "name": "my-skill"}),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            loaded.output.contains("## Skill: my-skill"),
+            "created skill should be loadable, got: {}",
+            loaded.output
+        );
+
+        restore_home(prev_home);
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_to_overwrite_unmanaged_skill() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        write_unmanaged_global_skill(temp.path(), "legacy");
+
+        let tool = create_test_tool();
+        let result = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "legacy",
+                    "description": "hijack",
+                    "body": "nope",
+                }),
+                create_test_context(),
+            )
+            .await;
+        assert!(result.is_err(), "create must refuse to clobber unmanaged skill");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("non-managed") && msg.contains("legacy"),
+            "unexpected error: {msg}"
+        );
+        // Original file untouched.
+        let content = std::fs::read_to_string(temp.path().join("skills/legacy/SKILL.md")).unwrap();
+        assert!(content.contains("Hand authored"));
+
+        restore_home(prev_home);
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_when_name_loaded_from_different_source() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        // A skill of the same name already loaded from a project-local dir.
+        let project = tempfile::tempdir().unwrap();
+        write_project_skill(project.path(), "conflict");
+
+        let tool = create_test_tool();
+        let result = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "conflict",
+                    "description": "managed variant",
+                    "body": "body",
+                }),
+                context_with_working_dir(project.path()),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "create must refuse when the name is loaded from another source"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already loaded from")
+        );
+
+        restore_home(prev_home);
+    }
+
+    #[tokio::test]
+    async fn test_update_managed_skill_and_refusals() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let tool = create_test_tool();
+
+        // Update before create: refused.
+        let missing = tool
+            .execute(
+                json!({"action": "update", "name": "ghost", "description": "d", "body": "b"}),
+                create_test_context(),
+            )
+            .await;
+        assert!(missing.is_err());
+        assert!(missing.unwrap_err().to_string().contains("No managed skill"));
+
+        // Create then update.
+        tool.execute(
+            json!({"action": "create", "name": "editable", "description": "v1", "body": "first"}),
+            create_test_context(),
+        )
+        .await
+        .unwrap();
+        tool.execute(
+            json!({"action": "update", "name": "editable", "description": "v2", "body": "second"}),
+            create_test_context(),
+        )
+        .await
+        .unwrap();
+        let content =
+            std::fs::read_to_string(temp.path().join("skills/editable/SKILL.md")).unwrap();
+        assert!(content.contains("v2") && content.contains("second"));
+        assert!(!content.contains("first"), "old body must be gone: {content}");
+
+        // Update a hand-authored (non-managed) skill: refused.
+        write_unmanaged_global_skill(temp.path(), "handmade");
+        let refused = tool
+            .execute(
+                json!({"action": "update", "name": "handmade", "description": "x", "body": "y"}),
+                create_test_context(),
+            )
+            .await;
+        assert!(refused.is_err());
+        assert!(refused.unwrap_err().to_string().contains("not managed"));
+
+        restore_home(prev_home);
+    }
+
+    #[tokio::test]
+    async fn test_delete_managed_skill_and_refusal() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let tool = create_test_tool();
+        tool.execute(
+            json!({"action": "create", "name": "temp-skill", "description": "d", "body": "b"}),
+            create_test_context(),
+        )
+        .await
+        .unwrap();
+        assert!(temp.path().join("skills/temp-skill/SKILL.md").exists());
+
+        let deleted = tool
+            .execute(
+                json!({"action": "delete", "name": "temp-skill"}),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        assert!(deleted.output.contains("Deleted managed skill 'temp-skill'"));
+        assert!(!temp.path().join("skills/temp-skill").exists());
+        // Reload dropped it from the registry.
+        assert!(tool.registry.read().await.get("temp-skill").is_none());
+
+        // Deleting a hand-authored skill: refused.
+        write_unmanaged_global_skill(temp.path(), "protected");
+        let refused = tool
+            .execute(
+                json!({"action": "delete", "name": "protected"}),
+                create_test_context(),
+            )
+            .await;
+        assert!(refused.is_err());
+        assert!(refused.unwrap_err().to_string().contains("not managed"));
+        assert!(temp.path().join("skills/protected/SKILL.md").exists());
+
+        restore_home(prev_home);
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_unsafe_name() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let tool = create_test_tool();
+        let result = tool
+            .execute(
+                json!({"action": "create", "name": "../escape", "description": "d", "body": "b"}),
+                create_test_context(),
+            )
+            .await;
+        assert!(result.is_err(), "path-traversal name must be rejected");
+        assert!(result.unwrap_err().to_string().contains("Invalid skill name"));
+
+        restore_home(prev_home);
     }
 }

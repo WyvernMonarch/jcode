@@ -64,6 +64,37 @@ struct ModelPickerFavoritesStore {
     favorites: HashSet<String>,
 }
 
+/// STATE column label for a /skills-setup row.
+fn skill_toggle_state_label(enabled: bool) -> String {
+    if enabled { "✓ on" } else { "✗ off" }.to_string()
+}
+
+/// New `[skills].exclude` after a /skills-setup save: hand-written glob
+/// patterns are preserved, exact names are replaced by the disabled rows.
+fn merge_skills_exclude(existing: &[String], disabled: &[String]) -> Vec<String> {
+    let mut exclude: Vec<String> = existing
+        .iter()
+        .filter(|pattern| pattern.contains('*'))
+        .cloned()
+        .collect();
+    exclude.extend(disabled.iter().cloned());
+    exclude.sort();
+    exclude.dedup();
+    exclude
+}
+
+/// One-line description snippet for a /skills-setup row.
+fn truncate_skill_description(description: &str) -> String {
+    const MAX: usize = 60;
+    let line = description.lines().next().unwrap_or("");
+    if line.chars().count() <= MAX {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(MAX - 1).collect();
+        format!("{cut}…")
+    }
+}
+
 fn model_picker_usage_path() -> Option<std::path::PathBuf> {
     crate::storage::app_config_dir()
         .ok()
@@ -2055,6 +2086,132 @@ impl App {
         }
     }
 
+    /// Open the /skills-setup checkbox picker: every global skill with an
+    /// on/off state seeded from `[skills].exclude`. Only meaningful before the
+    /// session has messages — the caller enforces the 0-message gate.
+    pub(super) fn open_skills_setup_picker(&mut self) {
+        self.refresh_skills_snapshot();
+        let cfg = crate::config::Config::load();
+        let excluded_exact: std::collections::BTreeSet<String> = cfg
+            .skills
+            .exclude
+            .iter()
+            .filter(|pattern| !pattern.contains('*'))
+            .cloned()
+            .collect();
+
+        // Loaded skills, plus exact-name exclusions that are currently
+        // filtered out of the registry (so they can be re-enabled).
+        let snapshot = self.current_skills_snapshot();
+        let mut rows: Vec<(String, String, bool)> = snapshot
+            .list()
+            .iter()
+            .map(|skill| (skill.name.clone(), skill.description.clone(), true))
+            .collect();
+        for name in &excluded_exact {
+            if !snapshot.contains(name) {
+                rows.push((name.clone(), "(disabled)".to_string(), false));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if rows.is_empty() {
+            self.push_display_message(DisplayMessage::system(
+                "No skills found to configure.".to_string(),
+            ));
+            return;
+        }
+
+        let entries: Vec<PickerEntry> = rows
+            .into_iter()
+            .map(|(name, description, enabled)| PickerEntry {
+                name: name.clone(),
+                options: vec![PickerOption {
+                    provider: skill_toggle_state_label(enabled),
+                    api_method: truncate_skill_description(&description),
+                    available: true,
+                    detail: String::new(),
+                    estimated_reference_cost_micros: None,
+                }],
+                action: PickerAction::SkillToggle { name },
+                selected_option: 0,
+                is_current: enabled,
+                is_default: false,
+                is_favorite: false,
+                recommended: false,
+                recommendation_rank: usize::MAX,
+                usage_score: 0,
+                old: false,
+                created_date: None,
+                effort: None,
+            })
+            .collect();
+
+        let filtered = (0..entries.len()).collect();
+        self.inline_interactive_state = Some(InlineInteractiveState {
+            kind: PickerKind::Skills,
+            entries,
+            filtered,
+            selected: 0,
+            column: 0,
+            filter: String::new(),
+            preview: false,
+        });
+        self.set_status_notice("Skills setup: ↵ toggle · Esc save");
+    }
+
+    /// Commit the /skills-setup picker: rewrite `[skills].exclude` (preserving
+    /// glob patterns, replacing exact names with the unchecked rows), reload
+    /// the skill registry, and close the picker.
+    pub(super) fn finish_skills_setup(&mut self) {
+        let Some(picker) = self.inline_interactive_state.take() else {
+            return;
+        };
+        let disabled: Vec<String> = picker
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_current)
+            .map(|entry| entry.name.clone())
+            .collect();
+
+        let cfg = crate::config::Config::load();
+        let exclude = merge_skills_exclude(&cfg.skills.exclude, &disabled);
+
+        match crate::config::Config::set_skills_exclude(exclude) {
+            Ok(()) => {
+                if self.is_remote {
+                    // The server owns the skill registry; ask it to reload on
+                    // the next remote pump tick.
+                    self.pending_skills_reload = true;
+                } else {
+                    // Local mode: reload the in-process shared registry off the
+                    // UI thread (blocking_write must not run inside async).
+                    std::thread::spawn(|| {
+                        let registry = crate::skill::SkillRegistry::shared_registry();
+                        let mut skills = registry.blocking_write();
+                        let _ = skills.reload_global();
+                    });
+                }
+                self.refresh_skills_snapshot();
+                let summary = if disabled.is_empty() {
+                    "all skills enabled".to_string()
+                } else {
+                    format!("disabled: {}", disabled.join(", "))
+                };
+                self.push_display_message(DisplayMessage::system(format!(
+                    "Skills setup saved ({summary}). Applies to this and future sessions."
+                )));
+                self.set_status_notice("Skills setup saved");
+            }
+            Err(error) => {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Failed to save skills setup: {error}"
+                )));
+                self.set_status_notice("Skills setup save failed");
+            }
+        }
+    }
+
     pub(super) fn open_session_picker(&mut self) {
         let current_dir = self.session.working_dir.clone();
         let (mut picker, status) = if let Some((server_groups, orphan_sessions)) =
@@ -2871,6 +3028,14 @@ impl App {
                     Self::apply_inline_interactive_filter(picker);
                     return Ok(());
                 }
+                if self
+                    .inline_interactive_state
+                    .as_ref()
+                    .is_some_and(|picker| picker.kind == PickerKind::Skills)
+                {
+                    self.finish_skills_setup();
+                    return Ok(());
+                }
                 self.inline_interactive_state = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3084,6 +3249,18 @@ impl App {
                 }
 
                 match entry.action {
+                    PickerAction::SkillToggle { name } => {
+                        if let Some(ref mut picker) = self.inline_interactive_state
+                            && let Some(entry) = picker.entries.get_mut(idx)
+                        {
+                            entry.is_current = !entry.is_current;
+                            if let Some(option) = entry.options.get_mut(0) {
+                                option.provider = skill_toggle_state_label(entry.is_current);
+                            }
+                            let state = if entry.is_current { "on" } else { "off" };
+                            self.set_status_notice(format!("{name}: {state}"));
+                        }
+                    }
                     PickerAction::Account(selection) => {
                         self.inline_interactive_state = None;
                         self.handle_account_picker_selection(selection);
@@ -3416,11 +3593,25 @@ mod tests {
         REMOTE_MODEL_CATALOG_CACHE_MAX_AGE_SECS, REMOTE_MODEL_CATALOG_CACHE_VERSION,
         REMOTE_MODEL_CATALOG_MAX_DETAIL_BYTES, RemoteModelCatalogCache,
         filter_routes_by_provider_allowlist, key_char_eq_ignore_ascii_case,
-        model_picker_route_is_current, model_picker_route_is_default,
+        merge_skills_exclude, model_picker_route_is_current, model_picker_route_is_default,
         model_picker_route_is_recommended, picker_is_runtime_model_picker,
         remote_model_catalog_cache_is_fresh, remote_model_catalog_cache_origin,
         remote_model_catalog_snapshot_is_safe, route_supports_reasoning_effort,
     };
+
+    #[test]
+    fn merge_skills_exclude_keeps_globs_replaces_exact_names() {
+        let existing = vec![
+            "figma-*".to_string(),
+            "old-exact".to_string(),
+            "grill*".to_string(),
+        ];
+        let disabled = vec!["teach".to_string(), "to-prd".to_string()];
+        let merged = merge_skills_exclude(&existing, &disabled);
+        assert_eq!(merged, vec!["figma-*", "grill*", "teach", "to-prd"]);
+        // "old-exact" was re-enabled (not in disabled) and must be gone.
+        assert!(!merged.iter().any(|p| p == "old-exact"));
+    }
     use crate::tui::{
         AgentModelTarget, App, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
         PickerOption,

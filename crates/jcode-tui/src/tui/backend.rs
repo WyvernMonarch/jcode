@@ -765,6 +765,15 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Ask the server to reload its global skill registry from disk + config.
+    pub async fn reload_skills(&mut self) -> Result<()> {
+        let request = Request::ReloadSkills {
+            id: self.next_request_id,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     /// Toggle a runtime feature on the server for this session
     pub async fn set_feature(&mut self, feature: FeatureToggle, enabled: bool) -> Result<()> {
         let request = Request::SetFeature {

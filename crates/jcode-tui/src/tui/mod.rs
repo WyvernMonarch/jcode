@@ -819,6 +819,10 @@ pub enum PickerKind {
     Account,
     Login,
     Usage,
+    /// Startup skills checkbox list (/skills-setup): Enter toggles a skill
+    /// on/off, Esc saves the exclusions to `[skills]` config. Only offered in
+    /// sessions with zero messages.
+    Skills,
 }
 
 /// What the first-run onboarding welcome screen should render in its body,
@@ -994,6 +998,17 @@ impl PickerKind {
                 shows_default_shortcut_hint: false,
                 preview_activation_column: 2,
             },
+            Self::Skills => InlineInteractiveSchema {
+                layout: InlineInteractiveLayout::Compact,
+                primary_label: "SKILL",
+                secondary_label: "STATE",
+                secondary_preview_label: "STATE",
+                tertiary_label: "",
+                preview_submit_hint: "  ↵ toggle",
+                active_submit_hint: "  ↑↓/jk ↵ toggle · Esc save",
+                shows_default_shortcut_hint: false,
+                preview_activation_column: 0,
+            },
         }
     }
 
@@ -1048,6 +1063,13 @@ impl PickerKind {
                 let detail = route.map(|option| option.detail.as_str()).unwrap_or("");
                 format!("{} {} {} {}", entry.name, provider, method, detail)
             }
+            Self::Skills => {
+                let state = entry
+                    .active_option()
+                    .map(|option| option.provider.as_str())
+                    .unwrap_or("");
+                format!("{} {}", entry.name, state)
+            }
         }
     }
 }
@@ -1072,6 +1094,8 @@ pub enum AgentModelTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerAction {
     Model,
+    /// Toggle a skill on/off in the /skills-setup checkbox picker.
+    SkillToggle { name: String },
     Account(AccountPickerAction),
     Login(crate::provider_catalog::LoginProviderDescriptor),
     Logout(crate::provider_catalog::LoginProviderDescriptor),
@@ -1131,6 +1155,7 @@ fn estimate_picker_action_bytes(action: &PickerAction) -> usize {
         | PickerAction::AgentTarget(_)
         | PickerAction::AgentModelChoice { .. }
         | PickerAction::LogoutAll => 0,
+        PickerAction::SkillToggle { name } => name.capacity(),
         PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => {
             provider_id.capacity() + label.capacity()
         }
