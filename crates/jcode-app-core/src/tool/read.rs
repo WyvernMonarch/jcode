@@ -264,12 +264,42 @@ impl Tool for ReadTool {
             ));
         }
 
-        if output.is_empty() {
-            Ok(ToolOutput::new("(empty file)"))
+        let hashline_header = hashline_tag_header(
+            &params.file_path,
+            &path,
+            &content,
+            crate::config::config().tools.read_hashline_tags,
+        );
+
+        let body = if output.is_empty() {
+            "(empty file)".to_string()
         } else {
-            Ok(ToolOutput::new(output))
+            output
+        };
+        match hashline_header {
+            Some(header) => Ok(ToolOutput::new(format!("{header}{body}"))),
+            None => Ok(ToolOutput::new(body)),
         }
     }
+}
+
+/// When `enabled`, returns a `[display_path#TAG]` header line and records a
+/// whole-file snapshot in the shared hashline `SnapshotStore`, so a later
+/// `hashline apply` can recover from a stale tag after this plain read. TAG
+/// hashes the FULL original `content`, never the truncated/windowed display.
+/// Off by default: returns `None` and touches nothing.
+fn hashline_tag_header(
+    display_path: &str,
+    resolved: &Path,
+    content: &str,
+    enabled: bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let tag = jcode_hashline::compute_tag(content);
+    super::hashline::store().record(&resolved.to_string_lossy(), content);
+    Some(format!("[{display_path}#{tag}]\n"))
 }
 
 #[cfg(test)]

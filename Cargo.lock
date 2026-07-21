@@ -3357,6 +3357,7 @@ dependencies = [
  "jcode-build-meta",
  "jcode-build-support",
  "jcode-core",
+ "jcode-hashline",
  "jcode-import-core",
  "jcode-message-types",
  "jcode-notify-email",
@@ -3588,6 +3589,15 @@ name = "jcode-gateway-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "jcode-hashline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]

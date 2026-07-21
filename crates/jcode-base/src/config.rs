@@ -547,6 +547,10 @@ pub struct ToolConfig {
     pub disabled: Vec<String>,
     /// Disable all built-in tools unless `enabled` is provided.
     pub disable_base_tools: bool,
+    /// When true, the `read` tool prepends a `[path#TAG]` hashline header and
+    /// records a whole-file snapshot so `hashline apply` can recover from a
+    /// stale tag after a plain read. Off by default (zero behavior change).
+    pub read_hashline_tags: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

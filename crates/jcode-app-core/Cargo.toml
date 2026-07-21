@@ -87,6 +87,7 @@ jcode-build-meta = { path = "../jcode-build-meta" }
 # this crate controls jcode-base's optional features (see [features] below).
 jcode-base = { path = "../jcode-base", default-features = false }
 jcode-core = { path = "../jcode-core" }
+jcode-hashline = { path = "../jcode-hashline" }
 jcode-message-types = { path = "../jcode-message-types" }
 jcode-overnight-core = { path = "../jcode-overnight-core" }
 jcode-plan = { path = "../jcode-plan" }

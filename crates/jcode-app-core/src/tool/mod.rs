@@ -6,6 +6,7 @@ mod batch;
 mod bg;
 mod browser;
 mod communicate;
+mod hashline;
 #[cfg(target_os = "macos")]
 mod computer;
 mod conversation_search;
@@ -171,6 +172,12 @@ impl Registry {
                 side_panel::SidePanelTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "edit", edit::EditTool::new);
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "hashline",
+                hashline::HashlineTool::new,
+            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
