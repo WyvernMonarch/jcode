@@ -160,5 +160,29 @@ Isolation recipe for e2e (also in the skill): `JCODE_HOME=<scratch> JCODE_RUNTIM
 Known cosmetic upstream bug: openai-compatible profiles print "Using OpenRouter" at startup.
 
 Deferred (round 3+ leftovers): auto-apply-on-completion for isolated members (explicit
-`collect` implemented instead), autolearn nudge, SQLite memory backend, snapcompact,
+`collect` implemented instead), autolearn nudge, SQLite memory backend,
 AST/LSP/DAP tools, omp-stats dashboard.
+
+## snapcompact results (2026-07-21, round 4)
+
+Landed: `jcode-snapcompact` crate (MIT rasterizer adapted from omp pi-natives: BDF/hex/TTF
+fonts, 17 eval-tuned shapes, ¶-scope serialization, cell pagination, foveated archive —
+29 tests) + opt-in integration (`[compaction] snapcompact = true`, vision gate via
+`Provider::supports_image_input()` or model-id regex, deterministic artifact replaces the
+summary-LLM call, flat 5024 tok/frame, fallback to summary on any blocker — 6 tests).
+
+Live e2e (isolated server, glm-5v-turbo): 320KB seeded across 8 user messages → manual
+compact → artifact applied in <20s with no LLM run (previous 39KB attempt correctly fell
+back to summary: both text edges [~19.2k chars each at 8on16-bw] swallowed the whole
+fixture, imaged middle empty). Recall of facts living ONLY in the imaged middle:
+exact hit ("November 19th"), near-miss on a 4-digit code (7351 vs 7391 — pixel-level
+misread), one hallucinated rare word ('launchdarkly' vs 'lampyrid'). Frames confirmed in
+provider requests (321KB request json = base64 PNGs).
+
+Findings worth acting on later: (1) glm-5v-turbo fidelity at 8on16-bw is mixed for codes/
+rare words — consider a `[compaction] snapcompact_shape` override (crate already supports
+explicit variants, e.g. silver16-bw/11on16-bw) and an omp-style shape eval for GLM;
+(2) gotchas for testers: config is read at server start (restart after toggling the flag),
+manual compact needs >10 messages, tool results serialize truncated to 2000 chars — feed
+long fixtures as user messages; (3) session takeover + client disconnect drops
+debug-created sessions — keep one wire connection for seed/compact/recall.
