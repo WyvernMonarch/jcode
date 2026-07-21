@@ -138,6 +138,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/skills-setup",
         "Toggle which skills load (fresh sessions only)",
     ),
+    RegisteredCommand::public(
+        "/tools-setup",
+        "Toggle which tools are exposed (fresh sessions only)",
+    ),
     RegisteredCommand::public("/version", "Show current version"),
     RegisteredCommand::public("/changelog", "Show recent changes in this build"),
     RegisteredCommand::public("/info", "Show session info and tokens"),

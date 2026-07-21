@@ -1295,6 +1295,9 @@ pub struct App {
     /// Set by /skills-setup save in remote mode: ask the server to reload its
     /// global skill registry on the next remote pump tick.
     pub(super) pending_skills_reload: bool,
+    /// Set by /tools-setup save in remote mode: clear (recreate) the empty
+    /// session on the next remote pump tick so the new [tools] config applies.
+    pub(super) pending_tools_reset: bool,
     pending_route_selection: Option<crate::provider::RouteSelection>,
     // Reasoning-effort variant chosen together with a model in the picker
     // (e.g. "gpt-5.5 (high)"), staged for remote mode alongside the model

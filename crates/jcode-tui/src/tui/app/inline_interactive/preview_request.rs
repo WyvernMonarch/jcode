@@ -85,6 +85,7 @@ pub(super) fn picker_account_provider_scope(picker: &InlineInteractiveState) -> 
         })
         | PickerAction::Model
         | PickerAction::SkillToggle { .. }
+        | PickerAction::ToolToggle { .. }
         | PickerAction::Login(_)
         | PickerAction::Logout(_)
         | PickerAction::LogoutAll
