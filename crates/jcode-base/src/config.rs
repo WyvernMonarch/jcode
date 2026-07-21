@@ -460,6 +460,9 @@ pub struct Config {
     /// Skill loading / prompt-surface configuration
     pub skills: SkillsConfig,
 
+    /// Custom swarm agent roles and categories (config-defined, no built-ins)
+    pub swarm: SwarmConfig,
+
     /// Agent Client Protocol adapter configuration
     pub acp: AcpConfig,
 
@@ -564,6 +567,199 @@ impl Default for SkillsConfig {
             exclude: Vec::new(),
             user_invoked_only: Vec::new(),
         }
+    }
+}
+
+/// Custom swarm agents: user-defined spawn roles and categories.
+///
+/// Nothing is hardcoded — both maps take arbitrary names. A spawn may pass
+/// `category` (semantic work-kind: quick/deep/vision/...) or `role` (a named
+/// agent: reviewer/researcher/...). A role may itself inherit a category.
+///
+/// [swarm.categories.quick]
+/// model = "glm-5-turbo"
+/// effort = "low"
+///
+/// [swarm.roles.reviewer]
+/// category = "quick"
+/// prompt_append = "You are a read-only reviewer: max 3 blockers."
+/// disabled_tools = ["write", "edit", "apply_patch"]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SwarmConfig {
+    pub categories: BTreeMap<String, SwarmCategoryConfig>,
+    pub roles: BTreeMap<String, SwarmRoleConfig>,
+}
+
+/// One semantic work-kind (`[swarm.categories.<name>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SwarmCategoryConfig {
+    /// Shown to the coordinator in the swarm tool description.
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Appended to the member's startup message to shape behavior.
+    pub prompt_append: Option<String>,
+}
+
+/// One named custom agent (`[swarm.roles.<name>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SwarmRoleConfig {
+    /// Shown to the coordinator in the swarm tool description.
+    pub description: Option<String>,
+    /// Inherit model/effort/prompt_append from this category; role fields win.
+    pub category: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Appended to the member's startup message (after the category's append).
+    pub prompt_append: Option<String>,
+    /// Tools removed for this member (on top of global [tools] filtering).
+    pub disabled_tools: Vec<String>,
+    /// Skill names whose full bodies are appended to the startup message.
+    pub skills: Vec<String>,
+    /// Default isolation (git worktree) for this role; explicit spawn arg wins.
+    pub isolated: Option<bool>,
+}
+
+/// Fully resolved spawn parameters from role/category config.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedSwarmSpawn {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Category append first, then role append, joined by blank lines.
+    pub prompt_append: Option<String>,
+    pub disabled_tools: Vec<String>,
+    pub skills: Vec<String>,
+    pub isolated: Option<bool>,
+}
+
+impl SwarmConfig {
+    /// Resolve a spawn's `role`/`category` against the config.
+    ///
+    /// Precedence inside the result: role fields override its category's.
+    /// Unknown names return an actionable error listing what exists.
+    pub fn resolve(
+        &self,
+        role: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<ResolvedSwarmSpawn, String> {
+        let mut out = ResolvedSwarmSpawn::default();
+        let mut appends: Vec<String> = Vec::new();
+
+        let category_name = match role {
+            Some(name) => {
+                let Some(role_cfg) = self.roles.get(name) else {
+                    return Err(format!(
+                        "unknown swarm role '{name}'; configured roles: {}",
+                        if self.roles.is_empty() {
+                            "(none — add [swarm.roles.<name>] to config)".to_string()
+                        } else {
+                            self.roles.keys().cloned().collect::<Vec<_>>().join(", ")
+                        }
+                    ));
+                };
+                role_cfg.category.as_deref().or(category)
+            }
+            None => category,
+        };
+
+        if let Some(name) = category_name {
+            let Some(cat) = self.categories.get(name) else {
+                return Err(format!(
+                    "unknown swarm category '{name}'; configured categories: {}",
+                    if self.categories.is_empty() {
+                        "(none — add [swarm.categories.<name>] to config)".to_string()
+                    } else {
+                        self.categories.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                ));
+            };
+            out.model = cat.model.clone();
+            out.effort = cat.effort.clone();
+            if let Some(append) = cat.prompt_append.as_deref().map(str::trim)
+                && !append.is_empty()
+            {
+                appends.push(append.to_string());
+            }
+        }
+
+        if let Some(name) = role {
+            let role_cfg = &self.roles[name];
+            if role_cfg.model.is_some() {
+                out.model = role_cfg.model.clone();
+            }
+            if role_cfg.effort.is_some() {
+                out.effort = role_cfg.effort.clone();
+            }
+            if let Some(append) = role_cfg.prompt_append.as_deref().map(str::trim)
+                && !append.is_empty()
+            {
+                appends.push(append.to_string());
+            }
+            out.disabled_tools = role_cfg.disabled_tools.clone();
+            out.skills = role_cfg.skills.clone();
+            out.isolated = role_cfg.isolated;
+        }
+
+        if !appends.is_empty() {
+            out.prompt_append = Some(appends.join("\n\n"));
+        }
+        Ok(out)
+    }
+
+    /// Render the configured roles/categories for the swarm tool description
+    /// so the coordinator always sees the live roster. Empty string when
+    /// nothing is configured.
+    pub fn describe_for_tool(&self) -> String {
+        if self.categories.is_empty() && self.roles.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        if !self.categories.is_empty() {
+            out.push_str("Configured spawn categories (pass category=\"<name>\"):\n");
+            for (name, cat) in &self.categories {
+                out.push_str(&format!(
+                    "- {name}: {}{}\n",
+                    cat.description.as_deref().unwrap_or("(no description)"),
+                    match (&cat.model, &cat.effort) {
+                        (Some(m), Some(e)) => format!(" [{m}, effort {e}]"),
+                        (Some(m), None) => format!(" [{m}]"),
+                        (None, Some(e)) => format!(" [effort {e}]"),
+                        (None, None) => String::new(),
+                    }
+                ));
+            }
+        }
+        if !self.roles.is_empty() {
+            out.push_str("Configured spawn roles (pass agent=\"<name>\"):\n");
+            for (name, role) in &self.roles {
+                let mut traits = Vec::new();
+                if let Some(cat) = &role.category {
+                    traits.push(format!("category {cat}"));
+                }
+                if let Some(m) = &role.model {
+                    traits.push(m.clone());
+                }
+                if !role.disabled_tools.is_empty() {
+                    traits.push(format!("no {}", role.disabled_tools.join("/")));
+                }
+                if role.isolated == Some(true) {
+                    traits.push("isolated".to_string());
+                }
+                out.push_str(&format!(
+                    "- {name}: {}{}\n",
+                    role.description.as_deref().unwrap_or("(no description)"),
+                    if traits.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", traits.join(", "))
+                    }
+                ));
+            }
+        }
+        out.trim_end().to_string()
     }
 }
 

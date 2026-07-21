@@ -314,6 +314,51 @@ fn test_env_override_memory_sidecar() {
 }
 
 #[test]
+fn swarm_config_resolves_role_over_category_with_appends() {
+    let cfg: crate::config::SwarmConfig = toml::from_str(
+        r#"
+        [categories.quick]
+        model = "glm-5-turbo"
+        effort = "low"
+        prompt_append = "Be fast."
+
+        [roles.reviewer]
+        category = "quick"
+        effort = "medium"
+        prompt_append = "Max 3 blockers."
+        disabled_tools = ["write", "edit"]
+        isolated = true
+        "#,
+    )
+    .expect("parse swarm config");
+
+    // Category alone.
+    let cat = cfg.resolve(None, Some("quick")).expect("category resolves");
+    assert_eq!(cat.model.as_deref(), Some("glm-5-turbo"));
+    assert_eq!(cat.effort.as_deref(), Some("low"));
+    assert_eq!(cat.prompt_append.as_deref(), Some("Be fast."));
+    assert!(cat.disabled_tools.is_empty());
+
+    // Role inherits its category, overrides effort, concatenates appends.
+    let role = cfg.resolve(Some("reviewer"), None).expect("role resolves");
+    assert_eq!(role.model.as_deref(), Some("glm-5-turbo"));
+    assert_eq!(role.effort.as_deref(), Some("medium"));
+    assert_eq!(role.prompt_append.as_deref(), Some("Be fast.\n\nMax 3 blockers."));
+    assert_eq!(role.disabled_tools, vec!["write", "edit"]);
+    assert_eq!(role.isolated, Some(true));
+
+    // Unknown names produce actionable errors.
+    let err = cfg.resolve(Some("nope"), None).unwrap_err();
+    assert!(err.contains("unknown swarm role 'nope'") && err.contains("reviewer"));
+    let err = cfg.resolve(None, Some("nope")).unwrap_err();
+    assert!(err.contains("unknown swarm category 'nope'") && err.contains("quick"));
+
+    // Description rendering mentions both.
+    let desc = cfg.describe_for_tool();
+    assert!(desc.contains("quick") && desc.contains("reviewer") && desc.contains("no write/edit"));
+}
+
+#[test]
 fn tool_config_defaults_to_full_toolset() {
     let selection = ToolConfig::default().selection();
     assert!(selection.allowed_tools.is_none());

@@ -542,6 +542,10 @@ pub enum Request {
         /// otherwise derived from the first line of `initial_message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Tools to disable for the spawned member (from `[swarm.roles]`
+        /// config), applied on top of the member's global tool filtering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_disabled_tools: Option<Vec<String>>,
     },
 
     /// List models/routes available for spawning swarm agents
