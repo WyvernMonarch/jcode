@@ -21,8 +21,9 @@ use crate::provider::openai_request::{
     openai_encrypted_content_fallback_summary, openai_encrypted_content_is_sendable,
 };
 use anyhow::Result;
+use regex::Regex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -31,14 +32,114 @@ pub use jcode_compaction_core::{
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
     MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
-    SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
-    TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
-    compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
-    emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,
-    is_request_payload_too_large_error, mean_embedding, message_char_count, safe_compaction_cutoff,
-    semantic_cache_key, semantic_goal_text, semantic_message_text, strip_large_images_in_contents,
-    summary_payload_char_count,
+    SEMANTIC_EMBED_CACHE_CAPACITY, SNAPCOMPACT_FRAME_TOKEN_COST, SUMMARY_PROMPT,
+    SYSTEM_OVERHEAD_TOKENS, Summary, TOKEN_HISTORY_WINDOW, build_compaction_prompt,
+    build_emergency_summary_text, compacted_summary_text_block, content_char_count,
+    effective_context_tokens_from_usage, emergency_strip_large_images,
+    emergency_truncate_large_payloads, estimate_compaction_tokens,
+    estimate_compaction_tokens_from_chars, is_request_payload_too_large_error, mean_embedding,
+    message_char_count, safe_compaction_cutoff, semantic_cache_key, semantic_goal_text,
+    semantic_message_text, strip_large_images_in_contents, summary_payload_char_count,
 };
+
+/// Marker stored as the text summary for a snapcompact compaction. The real
+/// artifact is the rendered image/text blocks carried alongside it; this text is
+/// only surfaced as a graceful fallback (e.g. after a session is restored from
+/// disk, where the frames are not persisted).
+const SNAPCOMPACT_SUMMARY_MARKER: &str =
+    "Prior conversation history was compacted into snapcompact image frames.";
+
+/// Vision heuristic fallback: model ids matching this suggest a vision-capable
+/// model (e.g. `glm-5v-turbo`, `gpt-4-vision`, `-v2`). Used only when the
+/// provider does not report [`Provider::supports_image_input`], which is the
+/// authoritative signal. jcode has no capability field in provider-metadata, so
+/// `supports_image_input()` (provider-implemented) is preferred and this regex
+/// is the documented fallback per the task's `/5v|vision|[-_]v[0-9]?/i`.
+static VISION_MODEL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)5v|vision|[-_]v[0-9]?").expect("vision model regex"));
+
+fn model_suggests_vision(model_id: &str) -> bool {
+    VISION_MODEL_RE.is_match(model_id)
+}
+
+/// Whether snapcompact should replace the summary-LLM path for this provider.
+/// Config-gated (opt-in, default off) AND vision-gated.
+fn snapcompact_enabled(provider: &dyn Provider) -> bool {
+    crate::config::config().compaction.snapcompact
+        && (provider.supports_image_input() || model_suggests_vision(&provider.model()))
+}
+
+/// Render the dropped history to snapcompact blocks (summary-prompt text +
+/// imaged middle + text edges). Returns `None` on any local blocker — an empty
+/// history, a rasterizer error, or a result with no image frames — so the caller
+/// falls back to the summary path. This is the directly unit-testable assembly
+/// half; no provider or LLM is involved.
+fn build_snapcompact_artifact(dropped: &[Message], model_id: &str) -> Option<Vec<ContentBlock>> {
+    if dropped.is_empty() {
+        return None;
+    }
+    match jcode_snapcompact::compact_to_blocks(
+        dropped,
+        model_id,
+        jcode_snapcompact::MAX_FRAMES_DEFAULT,
+    ) {
+        Ok(blocks) if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => Some(blocks),
+        Ok(_) => None,
+        Err(e) => {
+            crate::logging::warn(&format!(
+                "[compaction] snapcompact rasterization failed ({e}); falling back to summary path"
+            ));
+            None
+        }
+    }
+}
+
+/// Build the leading compaction-artifact message spliced ahead of the active
+/// tail. With snapcompact frames present, they replace the summary text block
+/// verbatim (same position); otherwise the existing text / OpenAI-native summary
+/// block is used. Pure and directly testable with fixture inputs.
+fn build_compaction_artifact_message(
+    summary: &Summary,
+    snapcompact_blocks: Option<&[ContentBlock]>,
+) -> Message {
+    let content = match snapcompact_blocks {
+        Some(blocks) if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => {
+            blocks.to_vec()
+        }
+        _ => vec![
+            summary
+                .openai_encrypted_content
+                .as_ref()
+                .map(|encrypted_content| ContentBlock::OpenAICompaction {
+                    encrypted_content: encrypted_content.clone(),
+                })
+                .unwrap_or_else(|| ContentBlock::Text {
+                    text: compacted_summary_text_block(&summary.text),
+                    cache_control: None,
+                }),
+        ],
+    };
+    Message {
+        role: Role::User,
+        content,
+        timestamp: None,
+        tool_duration_ms: None,
+    }
+}
+
+/// Char-equivalent cost of a snapcompact artifact for token estimation: each
+/// image frame bills a flat [`SNAPCOMPACT_FRAME_TOKEN_COST`]; text edges bill by
+/// length. Fed to the shared char-based estimator.
+fn snapcompact_summary_chars(blocks: &[ContentBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Image { .. } => SNAPCOMPACT_FRAME_TOKEN_COST * CHARS_PER_TOKEN,
+            ContentBlock::Text { text, .. } => text.len(),
+            _ => 0,
+        })
+        .sum()
+}
 
 const HARD_THRESHOLD_PENDING_WAIT_MS: u64 = 15_000;
 const HARD_THRESHOLD_PENDING_POLL_MS: u64 = 50;
@@ -50,6 +151,9 @@ struct CompactionResult {
     covers_up_to_turn: usize,
     duration_ms: u64,
     summarized_messages: usize,
+    /// Rendered snapcompact artifact (summary-prompt text + imaged history),
+    /// present only when the snapcompact strategy replaced the summary LLM call.
+    snapcompact_blocks: Option<Vec<ContentBlock>>,
 }
 
 struct CompactionOutcomeLog<'a> {
@@ -139,6 +243,12 @@ pub struct CompactionManager {
     /// Active summary (if we've compacted before)
     active_summary: Option<Summary>,
 
+    /// Rendered snapcompact artifact for the current `active_summary`, when the
+    /// snapcompact strategy replaced the summary LLM call. Spliced ahead of the
+    /// active tail in place of the text summary block. Not persisted: after a
+    /// restore this is `None` and assembly falls back to the summary marker text.
+    snapcompact_blocks: Option<Vec<ContentBlock>>,
+
     /// Rolling char estimate for the active (non-compacted) message suffix.
     ///
     /// In the common append-only case this is maintained incrementally, so token
@@ -211,6 +321,7 @@ impl CompactionManager {
         Self {
             compacted_count: 0,
             active_summary: None,
+            snapcompact_blocks: None,
             active_chars: ActiveCharEstimate::default(),
             pending_task: None,
             pending_trigger: None,
@@ -341,6 +452,8 @@ impl CompactionManager {
             covers_up_to_turn: state.covers_up_to_turn,
             original_turn_count: state.original_turn_count,
         });
+        // Frames are not persisted; the next compaction re-renders them.
+        self.snapcompact_blocks = None;
         self.suppress_compaction_until_new_message = total_messages > 0;
     }
 
@@ -787,15 +900,26 @@ impl CompactionManager {
 
     /// Get current token estimate using the caller's message list
     pub fn token_estimate_with(&self, all_messages: &[Message]) -> usize {
-        estimate_compaction_tokens(
-            self.active_summary.as_ref(),
-            self.active_message_chars_with(all_messages),
-            self.token_budget,
-        )
+        let active_chars = self.active_message_chars_with(all_messages);
+        if let Some(blocks) = &self.snapcompact_blocks {
+            // Bill snapcompact frames flat (5024 tokens each) instead of the raw
+            // summary text length; text edges bill by length.
+            return estimate_compaction_tokens_from_chars(
+                snapcompact_summary_chars(blocks) + active_chars,
+                self.token_budget,
+            );
+        }
+        estimate_compaction_tokens(self.active_summary.as_ref(), active_chars, self.token_budget)
     }
 
     /// Get current token estimate (backward compat — uses 0 messages, only summary + observed)
     pub fn token_estimate(&self) -> usize {
+        if let Some(blocks) = &self.snapcompact_blocks {
+            return estimate_compaction_tokens_from_chars(
+                snapcompact_summary_chars(blocks),
+                self.token_budget,
+            );
+        }
         estimate_compaction_tokens(self.active_summary.as_ref(), 0, self.token_budget)
     }
 
@@ -888,6 +1012,7 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        let snapcompact = plan_snapcompact(&*provider, all_messages, self.compacted_count + cutoff);
         let mode_label = self.mode_trigger_label().to_string();
         let estimated_tokens = self.effective_token_count_with(all_messages);
         crate::logging::info(&format!(
@@ -905,9 +1030,13 @@ impl CompactionManager {
         // Spawn background task that notifies via Bus when done
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let result = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                snapcompact,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction ({}) finished in {:.2}s ({} messages summarized)",
@@ -1112,15 +1241,20 @@ impl CompactionManager {
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
+        let snapcompact = plan_snapcompact(&*provider, all_messages, self.compacted_count + cutoff);
 
         self.pending_cutoff = cutoff;
         self.pending_trigger = Some("manual".to_string());
 
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let result = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                snapcompact,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction finished in {:.2}s ({} messages summarized)",
@@ -1200,6 +1334,9 @@ impl CompactionManager {
                     covers_up_to_turn: result.covers_up_to_turn,
                     original_turn_count: self.pending_cutoff,
                 };
+                // Carry (or clear, for a non-snapcompact result) the rendered
+                // snapcompact artifact alongside its summary.
+                let snapcompact_blocks = result.snapcompact_blocks;
 
                 // Advance the compacted count — these messages are now summarized
                 self.compacted_count = self.compacted_count.saturating_add(self.pending_cutoff);
@@ -1213,6 +1350,7 @@ impl CompactionManager {
 
                 // Store summary
                 self.active_summary = Some(summary);
+                self.snapcompact_blocks = snapcompact_blocks;
                 self.discard_oversized_openai_native_compaction();
                 self.observed_input_tokens = None;
                 let post_tokens = self.effective_token_count_with(all_messages) as u64;
@@ -1298,25 +1436,11 @@ impl CompactionManager {
 
         match &self.active_summary {
             Some(summary) => {
-                let summary_block = summary
-                    .openai_encrypted_content
-                    .as_ref()
-                    .map(|encrypted_content| ContentBlock::OpenAICompaction {
-                        encrypted_content: encrypted_content.clone(),
-                    })
-                    .unwrap_or_else(|| ContentBlock::Text {
-                        text: compacted_summary_text_block(&summary.text),
-                        cache_control: None,
-                    });
+                let artifact =
+                    build_compaction_artifact_message(summary, self.snapcompact_blocks.as_deref());
 
                 let mut result = Vec::with_capacity(active.len() + 1);
-
-                result.push(Message {
-                    role: Role::User,
-                    content: vec![summary_block],
-                    timestamp: None,
-                    tool_duration_ms: None,
-                });
+                result.push(artifact);
 
                 // Clone only the active (non-compacted) messages
                 result.extend(active.iter().cloned());
@@ -1532,6 +1656,9 @@ impl CompactionManager {
             .min(all_messages.len());
         self.active_chars.set_exact(remaining_suffix_chars[cutoff]);
         self.active_summary = Some(summary);
+        // Emergency compaction is text-only; drop any prior snapcompact frames so
+        // stale image blocks are never prepended alongside the emergency summary.
+        self.snapcompact_blocks = None;
         self.observed_input_tokens = None;
         let post_tokens = self.effective_token_count_with(all_messages) as u64;
         self.last_compaction = Some(CompactionEvent {
@@ -1676,8 +1803,31 @@ async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
+    snapcompact: Option<SnapcompactPlan>,
 ) -> Result<CompactionResult> {
     let start = Instant::now();
+
+    // Snapcompact strategy: replace the summary LLM call with deterministic
+    // image frames rendered from the full dropped-history prefix. On any local
+    // blocker (`None`), fall through to the existing summary path.
+    if let Some(plan) = &snapcompact
+        && let Some(blocks) = build_snapcompact_artifact(&plan.prefix, &plan.model_id)
+    {
+        crate::logging::info(&format!(
+            "[compaction] snapcompact: rendered {} artifact block(s) from {} dropped message(s) — no summary LLM call",
+            blocks.len(),
+            plan.prefix.len(),
+        ));
+        return Ok(CompactionResult {
+            summary_text: SNAPCOMPACT_SUMMARY_MARKER.to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: messages.len(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            summarized_messages: messages.len(),
+            snapcompact_blocks: Some(blocks),
+        });
+    }
+
     if let Some(summary) = existing_summary.as_mut()
         && let Some(encrypted_content) = summary.openai_encrypted_content.as_ref()
         && !openai_encrypted_content_is_sendable(encrypted_content)
@@ -1726,6 +1876,7 @@ async fn generate_compaction_artifact(
                 covers_up_to_turn: messages.len(),
                 duration_ms: start.elapsed().as_millis() as u64,
                 summarized_messages: messages.len(),
+                snapcompact_blocks: None,
             });
         }
     }
@@ -1747,6 +1898,39 @@ async fn generate_compaction_artifact(
         covers_up_to_turn: messages.len(),
         duration_ms: start.elapsed().as_millis() as u64,
         summarized_messages: messages.len(),
+        snapcompact_blocks: None,
+    })
+}
+
+/// A planned snapcompact render: the full dropped-history prefix to rasterize
+/// and the model id that selects the frame shape. Built at compaction-start
+/// (where the provider and full message list are available) and rendered inside
+/// the background task so the (deterministic, LLM-free) rasterization stays off
+/// the request hot path.
+struct SnapcompactPlan {
+    prefix: Vec<Message>,
+    model_id: String,
+}
+
+/// Build a [`SnapcompactPlan`] when the snapcompact strategy applies. `prefix`
+/// is the entire compacted-history span (`all_messages[..new_compacted_count]`),
+/// so re-rendering after a later compaction stays cumulative rather than losing
+/// earlier frames.
+fn plan_snapcompact(
+    provider: &dyn Provider,
+    all_messages: &[Message],
+    new_compacted_count: usize,
+) -> Option<SnapcompactPlan> {
+    if !snapcompact_enabled(provider) {
+        return None;
+    }
+    let end = new_compacted_count.min(all_messages.len());
+    if end == 0 {
+        return None;
+    }
+    Some(SnapcompactPlan {
+        prefix: all_messages[..end].to_vec(),
+        model_id: provider.model(),
     })
 }
 
@@ -1773,7 +1957,10 @@ pub async fn build_transfer_compaction_state(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary).await?;
+    // Cross-session transfer always produces a portable text summary (frames are
+    // not persisted); snapcompact is a live-session strategy only.
+    let result =
+        generate_compaction_artifact(provider, messages.clone(), existing_summary, None).await?;
     let total_turns = prior_turns + messages.len();
 
     Ok(Some(crate::session::StoredCompactionState {

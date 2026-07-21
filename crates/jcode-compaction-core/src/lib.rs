@@ -57,6 +57,12 @@ pub const CHARS_PER_TOKEN: usize = 4;
 /// We charge a flat, slightly conservative per-image token budget instead.
 pub const IMAGE_TOKEN_COST: usize = 1_600;
 
+/// Flat token cost billed per snapcompact archive frame (a dense pixel-font PNG
+/// page of transcript, not an ordinary content image). Mirrors upstream
+/// `FRAME_TOKEN_ESTIMATE`; kept distinct from [`IMAGE_TOKEN_COST`] so ordinary
+/// inline images and snapcompact frames are estimated independently.
+pub const SNAPCOMPACT_FRAME_TOKEN_COST: usize = 5_024;
+
 /// Fixed token overhead for system prompt + tool definitions.
 /// These are not counted in message content but do count toward the context limit.
 /// Estimated conservatively: ~8k tokens for system prompt + ~10k for 50+ tools.

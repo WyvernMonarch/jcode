@@ -1,0 +1,15 @@
+[package]
+name = "jcode-snapcompact"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+fontdue = "0.9"
+png = "0.17"
+regex = "1"
+serde_json = "1"
+unicode-normalization = "0.1"
+unicode-properties = "0.1"
+jcode-message-types = { path = "../jcode-message-types" }
