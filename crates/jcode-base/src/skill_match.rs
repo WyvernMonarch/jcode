@@ -34,7 +34,13 @@ pub fn suggest_skills(registry: &SkillRegistry, query: &str, k: usize) -> Vec<(S
         return Vec::new();
     }
 
-    let skills = registry.list();
+    // User-invoked-only skills (`disable-model-invocation`) are never hinted:
+    // suggesting one to the model contradicts the skill's own contract.
+    let skills: Vec<_> = registry
+        .list()
+        .into_iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
     let docs: Vec<Vec<&str>> = skills
         .iter()
         .map(|s| s.search_text().split_whitespace().collect())
@@ -102,6 +108,18 @@ mod tests {
         .expect("write skill");
     }
 
+    fn write_user_only_skill(root: &Path, name: &str, description: &str, body: &str) {
+        let dir = root.join(".jcode").join("skills").join(name);
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\ndisable-model-invocation: true\n---\n\n{body}\n"
+            ),
+        )
+        .expect("write skill");
+    }
+
     /// Build an isolated registry from temp SKILL.md files (project overlay only,
     /// no global/plugin skills) so ranking is deterministic in tests.
     fn registry_from_temp(temp: &Path) -> SkillRegistry {
@@ -130,6 +148,24 @@ mod tests {
         assert_eq!(
             hits[0].0, "db-migrations",
             "the matching skill must rank first, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn user_invoked_only_skill_is_never_suggested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_user_only_skill(
+            temp.path(),
+            "db-migrations",
+            "Run and author database schema migrations. Apply or roll back a migration file.",
+            "Use this to migrate the database schema safely.",
+        );
+        let registry = registry_from_temp(temp.path());
+
+        let hits = suggest_skills(&registry, "how do I roll back a database schema migration", 3);
+        assert!(
+            hits.is_empty(),
+            "a disable-model-invocation skill must never be hinted, got {hits:?}"
         );
     }
 

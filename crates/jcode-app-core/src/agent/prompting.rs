@@ -149,10 +149,13 @@ impl Agent {
             .as_ref()
             .and_then(|name| skills.get(name).map(|skill| skill.get_prompt().to_string()));
 
+        // User-invoked-only skills (`disable-model-invocation`) stay out of the
+        // model-facing Available Skills list; they remain reachable via `/name`.
         let available_skills: Vec<crate::prompt::SkillInfo> = self
             .current_skills_snapshot()
             .list()
             .iter()
+            .filter(|skill| !skill.disable_model_invocation)
             .map(|skill| crate::prompt::SkillInfo {
                 name: skill.name.clone(),
                 description: skill.description.clone(),

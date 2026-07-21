@@ -14,6 +14,10 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// True when the skill is user-invoked only (`disable-model-invocation` in
+    /// frontmatter): it must stay out of the model-facing prompt surfaces
+    /// (Available Skills list, BM25 hints) and fire only via explicit `/name`.
+    pub disable_model_invocation: bool,
     pub content: String,
     pub path: PathBuf,
     search_text: String,
@@ -25,6 +29,8 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<String>,
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
     /// True when this skill was authored by the agent via `skill_manage`
     /// (create/update). Only managed skills may be updated/deleted or safely
     /// overwritten; hand-authored skills (no marker) are never clobbered.
@@ -496,6 +502,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
             ..
         } = frontmatter;
 
@@ -507,6 +514,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
             content: body,
             path: path.to_path_buf(),
             search_text,
@@ -995,10 +1003,36 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            disable_model_invocation: false,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: build_skill_search_text(name, description, content),
         }
+    }
+
+    #[test]
+    fn parse_skill_reads_disable_model_invocation_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("user-only");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: user-only\ndescription: Manual-only skill\ndisable-model-invocation: true\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+        let skill = SkillRegistry::parse_skill(&dir.join("SKILL.md")).expect("parse");
+        assert!(skill.disable_model_invocation);
+
+        // Absent flag defaults to false (model-invocable).
+        let dir2 = temp.path().join("normal");
+        std::fs::create_dir_all(&dir2).expect("create dir");
+        std::fs::write(
+            dir2.join("SKILL.md"),
+            "---\nname: normal\ndescription: Normal skill\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+        let skill = SkillRegistry::parse_skill(&dir2.join("SKILL.md")).expect("parse");
+        assert!(!skill.disable_model_invocation);
     }
 
     fn write_test_skill(root: &Path, scope: &str, name: &str) {
