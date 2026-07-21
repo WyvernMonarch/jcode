@@ -3373,6 +3373,7 @@ dependencies = [
  "jcode-tool-core",
  "jcode-tool-types",
  "jcode-update-core",
+ "jcode-worktree",
  "libc",
  "open",
  "rand 0.9.3",
@@ -4399,6 +4400,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "jcode-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
 ]
 
 [[package]]

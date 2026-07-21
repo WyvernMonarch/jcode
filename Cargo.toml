@@ -11,6 +11,7 @@ members = [
     "crates/jcode-agent-runtime",
     "crates/jcode-app-core",
     "crates/jcode-base",
+    "crates/jcode-worktree",
     "crates/jcode-tui",
     "crates/jcode-build-meta",
     "crates/jcode-ambient-types",
