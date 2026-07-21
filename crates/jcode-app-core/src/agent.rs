@@ -333,6 +333,20 @@ impl Agent {
         ))
     }
 
+    /// Add extra disabled tools for this session (swarm role restrictions).
+    /// Also refreshes the session tool policy and drops any locked tool
+    /// snapshot so the next turn rebuilds definitions with the new set —
+    /// intended to run before the member's first turn.
+    pub fn extend_disabled_tools(&mut self, extra: impl IntoIterator<Item = String>) {
+        self.disabled_tools.extend(extra);
+        crate::tool::set_session_tool_policy(
+            &self.session.id,
+            self.allowed_tools.clone(),
+            self.disabled_tools.clone(),
+        );
+        self.locked_tools = None;
+    }
+
     pub fn available_skill_names(&self) -> Vec<String> {
         self.current_skills_snapshot()
             .list()

@@ -563,6 +563,7 @@ pub(super) async fn spawn_swarm_agent(
     requested_model: Option<String>,
     requested_effort: Option<String>,
     label: Option<String>,
+    role_disabled_tools: Option<Vec<String>>,
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
     provider_template: &Arc<dyn Provider>,
@@ -619,6 +620,20 @@ pub(super) async fn spawn_swarm_agent(
         .as_deref()
         .map(append_swarm_completion_report_instructions);
 
+    // Role tool restrictions: visible spawns get them via JCODE_DISABLED_TOOLS
+    // (merged with the global [tools].disabled so the env override does not
+    // silently drop it); headless spawns are patched in-process below.
+    let role_disabled_env: Option<String> = role_disabled_tools
+        .as_ref()
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| {
+            let mut merged = crate::config::config().tools.disabled.clone();
+            merged.extend(tools.iter().cloned());
+            merged.sort();
+            merged.dedup();
+            merged.join(",")
+        });
+
     let visible_spawn = match resolved_spawn_mode {
         // Inline workers run in-process like headless ones; the difference is
         // purely how the coordinator renders them (a live inline gallery).
@@ -636,10 +651,13 @@ pub(super) async fn spawn_swarm_agent(
             |session_id, cwd, selfdev_requested, provider_key| {
                 // Tag the headed window as a swarm-agent spawn so spawn hooks
                 // and terminals can identify and reroute it (JCODE_SPAWN_*).
-                let context = crate::session_launch::SessionSpawnContext::kind("swarm-agent")
+                let mut context = crate::session_launch::SessionSpawnContext::kind("swarm-agent")
                     .env("JCODE_SPAWN_SWARM_ID", swarm_id)
                     .env("JCODE_SPAWN_COORDINATOR_SESSION_ID", req_session_id)
                     .with_client_terminal_env(client_terminal_env.clone());
+                if let Some(csv) = role_disabled_env.as_deref() {
+                    context = context.env("JCODE_DISABLED_TOOLS", csv);
+                }
                 spawn_visible_session_window_with_context(
                     session_id,
                     cwd,
@@ -692,6 +710,13 @@ pub(super) async fn spawn_swarm_agent(
             })
         }
     }?;
+
+    if is_headless_fallback
+        && let Some(extra) = role_disabled_tools.as_ref().filter(|tools| !tools.is_empty())
+        && let Some(agent) = sessions.read().await.get(&new_session_id).cloned()
+    {
+        agent.lock().await.extend_disabled_tools(extra.iter().cloned());
+    }
 
     let startup_message = startup_message.clone();
     {
@@ -836,6 +861,7 @@ pub(super) async fn handle_comm_spawn(
     model: Option<String>,
     effort: Option<String>,
     label: Option<String>,
+    role_disabled_tools: Option<Vec<String>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
@@ -919,6 +945,7 @@ pub(super) async fn handle_comm_spawn(
         model,
         effort,
         label,
+        role_disabled_tools,
         sessions,
         global_session_id,
         provider_template,

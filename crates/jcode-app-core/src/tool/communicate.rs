@@ -1528,6 +1528,42 @@ async fn run_swarm_plan_loop(
     }
 }
 
+/// Assemble a role-aware spawn startup message: the task, then the resolved
+/// `prompt_append` guidance, then the full body of each configured role skill.
+/// A configured skill that is not installed is a hard error (actionable),
+/// never a silent omission.
+fn build_role_spawn_message(
+    task: Option<String>,
+    prompt_append: Option<&str>,
+    skills: &[String],
+) -> Result<Option<String>> {
+    if prompt_append.is_none() && skills.is_empty() {
+        return Ok(task);
+    }
+    let mut out = task.unwrap_or_default().trim_end().to_string();
+    if let Some(append) = prompt_append.map(str::trim).filter(|a| !a.is_empty()) {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Role guidance\n\n");
+        out.push_str(append);
+    }
+    if !skills.is_empty() {
+        let registry = crate::skill::SkillRegistry::shared_snapshot();
+        for name in skills {
+            let Some(skill) = registry.get(name) else {
+                anyhow::bail!(
+                    "swarm role references skill '{name}' which is not installed; \
+                     install it or remove it from [swarm.roles] config"
+                );
+            };
+            out.push_str("\n\n");
+            out.push_str(&skill.get_prompt());
+        }
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
 async fn spawn_assignment_session(ctx: &ToolContext, params: &CommunicateInput) -> Result<String> {
     let spawn_request = Request::CommSpawn {
         id: REQUEST_ID,
@@ -1539,6 +1575,7 @@ async fn spawn_assignment_session(ctx: &ToolContext, params: &CommunicateInput) 
         model: params.model.clone(),
         effort: params.effort.clone(),
         label: None,
+        role_disabled_tools: None,
     };
 
     match send_request(spawn_request).await {
@@ -1791,13 +1828,20 @@ impl CommunicateTool {
     pub fn new() -> Self {
         const BASE_DESCRIPTION: &str = "Coordinate agents. In light-swarm and normal ad hoc use, only the root session may spawn agents, keeping execution to one level of fan-out. Recursive spawning is enabled only when the root session is running in swarm-deep mode; deep descendants may then spawn their own children, bounded by the configured live-agent limit and the absolute swarm member cap. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the agent that spawned them; you can stop any agent in the subtree you spawned.\n\nCommunication: prefer structural dataflow (task-graph artifacts via complete_node) over chat, and DMs for point-to-point coordination. broadcast reaches only your spawned subtree (whole swarm for the coordinator) and should be rare; channels and shared-context are discouraged legacy primitives.";
         let swarm_prompt = crate::prompt::load_swarm_prompt(None);
-        let description = if swarm_prompt.is_empty() {
+        let mut description = if swarm_prompt.is_empty() {
             BASE_DESCRIPTION.to_string()
         } else {
             format!(
                 "{BASE_DESCRIPTION}\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n{swarm_prompt}"
             )
         };
+        // Custom agent roster rendered live from [swarm] config so the
+        // coordinator always sees what roles/categories actually exist.
+        let roster = crate::config::config().swarm.describe_for_tool();
+        if !roster.is_empty() {
+            description.push_str("\n\n");
+            description.push_str(&roster);
+        }
         Self { description }
     }
 }
@@ -1900,6 +1944,15 @@ struct CommunicateInput {
     /// only when the coordinator calls `collect` for its session id. Default false.
     #[serde(default)]
     isolated: Option<bool>,
+    /// For the `spawn` action: a named custom agent from `[swarm.roles]`
+    /// config — resolves model/effort/prompt guidance/tool restrictions.
+    #[serde(default, rename = "agent")]
+    spawn_agent: Option<String>,
+    /// For the `spawn` action: a work-kind from `[swarm.categories]` config —
+    /// resolves model/effort/prompt guidance. Ignored when `agent` names its
+    /// own category.
+    #[serde(default)]
+    category: Option<String>,
 }
 
 impl CommunicateInput {
@@ -2024,6 +2077,14 @@ impl Tool for CommunicateTool {
                 "isolated": {
                     "type": "boolean",
                     "description": "For spawn: run the new agent in an isolated git worktree seeded from the parent checkout (default false). Its edits are held aside and applied back to the parent only when you call action=collect with target_session set to the spawned session id. Requires the spawn working_dir (or the coordinator's cwd) to be inside a git repo; falls back to a plain spawn with a note otherwise. On collect, a conflicting delta is not forced: the conflict is reported and the patch saved to a file for manual apply."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "For spawn: a named custom agent from [swarm.roles] config. Resolves the member's model, effort, behavior guidance, tool restrictions, skills, and default isolation. Explicit spawn args (model/effort/isolated) override the role's values. See 'Configured spawn roles' below for what exists."
+                },
+                "category": {
+                    "type": "string",
+                    "description": "For spawn: a work-kind from [swarm.categories] config (e.g. quick/deep). Resolves model, effort, and behavior guidance. Ignored when the given role names its own category. See 'Configured spawn categories' below."
                 },
                 "prompt": {
                     "type": "string",
@@ -2724,6 +2785,26 @@ impl Tool for CommunicateTool {
 
             "spawn" => {
                 let label = params.required_spawn_label()?;
+
+                // Resolve [swarm.roles]/[swarm.categories] config into spawn
+                // parameters. Explicit args always win over config values.
+                let resolved = if params.spawn_agent.is_some() || params.category.is_some() {
+                    crate::config::config()
+                        .swarm
+                        .resolve(params.spawn_agent.as_deref(), params.category.as_deref())
+                        .map_err(|e| anyhow::anyhow!(e))?
+                } else {
+                    crate::config::ResolvedSwarmSpawn::default()
+                };
+                let spawn_model = params.model.clone().or(resolved.model.clone());
+                let spawn_effort = params.effort.clone().or(resolved.effort.clone());
+                let spawn_isolated = params.isolated.or(resolved.isolated).unwrap_or(false);
+                let spawn_message = build_role_spawn_message(
+                    params.spawn_initial_message(),
+                    resolved.prompt_append.as_deref(),
+                    &resolved.skills,
+                )?;
+
                 // Opt-in isolation: build a git worktree seeded from the parent checkout and
                 // point the spawn at it, so the member's edits can be collected + applied back
                 // atomically later. Falls back to a plain spawn (with a note) when the target
@@ -2731,7 +2812,7 @@ impl Tool for CommunicateTool {
                 let mut spawn_working_dir = params.working_dir.clone();
                 let mut pending_isolation: Option<isolation::IsolatedSpawn> = None;
                 let mut isolation_note = String::new();
-                if params.isolated.unwrap_or(false) {
+                if spawn_isolated {
                     let base = params
                         .working_dir
                         .clone()
@@ -2761,12 +2842,14 @@ impl Tool for CommunicateTool {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
                     working_dir: spawn_working_dir,
-                    initial_message: params.spawn_initial_message(),
+                    initial_message: spawn_message,
                     request_nonce: None,
                     spawn_mode: params.spawn_mode.clone(),
-                    model: params.model.clone(),
-                    effort: params.effort.clone(),
+                    model: spawn_model,
+                    effort: spawn_effort,
                     label: Some(label),
+                    role_disabled_tools: (!resolved.disabled_tools.is_empty())
+                        .then(|| resolved.disabled_tools.clone()),
                 };
 
                 match send_request(request).await {
