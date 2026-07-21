@@ -1105,3 +1105,140 @@ fn test_recover_within_budget_summary_line_variants() {
     assert!(line.contains("shortened 5 large tool result(s)"));
     assert!(!line.contains("dropped"));
 }
+
+// ── snapcompact strategy ────────────────────────────────────────
+
+/// Serialized history large enough (~64,800 chars) to overflow both text edges
+/// and yield an imaged middle, mirroring the snapcompact crate's own fixture.
+fn big_conversation() -> Vec<Message> {
+    let big = "lorem ipsum dolor sit amet ".repeat(2400);
+    vec![make_text_message(Role::User, &big)]
+}
+
+#[test]
+fn snapcompact_model_heuristic_matches_vision_ids() {
+    assert!(model_suggests_vision("glm-5v-turbo"));
+    assert!(model_suggests_vision("gpt-4-vision-preview"));
+    assert!(model_suggests_vision("some-model-v2"));
+    assert!(!model_suggests_vision("claude-opus-4-8"));
+    assert!(!model_suggests_vision("glm-5-turbo"));
+    assert!(!model_suggests_vision("gpt-5"));
+}
+
+#[test]
+fn snapcompact_artifact_has_frames_and_prompt() {
+    let blocks = build_snapcompact_artifact(&big_conversation(), "glm-5v-turbo")
+        .expect("large vision-model history should render frames");
+    // First block is the verbatim summary prompt ending in the HISTORY marker.
+    match &blocks[0] {
+        ContentBlock::Text { text, .. } => {
+            assert!(text.contains("HISTORY"));
+            assert!(text.contains("resuming a prior conversation"));
+        }
+        other => panic!("expected summary prompt text, got {other:?}"),
+    }
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "imaged middle must be present"
+    );
+}
+
+#[test]
+fn snapcompact_artifact_none_on_trivial_history() {
+    // Empty or tiny history produces no frames → None so the caller falls back.
+    assert!(build_snapcompact_artifact(&[], "glm-5v-turbo").is_none());
+    let tiny = vec![make_text_message(Role::User, "hi")];
+    assert!(build_snapcompact_artifact(&tiny, "glm-5v-turbo").is_none());
+}
+
+#[test]
+fn snapcompact_assembly_splices_frames_over_summary_text() {
+    let summary = Summary {
+        text: "unused text summary".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+    };
+    let blocks = build_snapcompact_artifact(&big_conversation(), "glm-5v-turbo").unwrap();
+    let msg = build_compaction_artifact_message(&summary, Some(&blocks));
+
+    assert_eq!(msg.role, Role::User);
+    assert!(
+        msg.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "artifact must carry image frames"
+    );
+    assert!(
+        msg.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text { text, .. } if text.contains("HISTORY")
+        )),
+        "artifact must carry the summary prompt"
+    );
+    assert!(
+        !msg.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Text { text, .. } if text.contains("unused text summary")
+        )),
+        "frames replace the text summary, not append to it"
+    );
+}
+
+#[test]
+fn snapcompact_assembly_falls_back_to_text_summary_without_frames() {
+    let summary = Summary {
+        text: "real summary body".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+    };
+    // `None` simulates a rasterizer blocker → single text summary block.
+    let msg = build_compaction_artifact_message(&summary, None);
+    assert_eq!(msg.content.len(), 1);
+    match &msg.content[0] {
+        ContentBlock::Text { text, .. } => {
+            assert!(text.contains("Previous Conversation Summary"));
+            assert!(text.contains("real summary body"));
+        }
+        other => panic!("expected text summary block, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapcompact_token_estimate_bills_frames_flat() {
+    // Small budget → no system overhead, so the estimate isolates frame billing.
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    manager.active_summary = Some(Summary {
+        text: SNAPCOMPACT_SUMMARY_MARKER.to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 1,
+        original_turn_count: 1,
+    });
+    // Two tiny synthetic frames plus a short text edge.
+    manager.snapcompact_blocks = Some(vec![
+        ContentBlock::Text {
+            text: "edge".to_string(),
+            cache_control: None,
+        },
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        },
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "BBBB".to_string(),
+        },
+    ]);
+
+    let est = manager.token_estimate();
+    // Two frames bill 2 * 5024 tokens flat — never by their tiny base64 length
+    // (which would make the estimate a handful of tokens).
+    assert!(est >= 2 * SNAPCOMPACT_FRAME_TOKEN_COST, "got {est}");
+    assert!(
+        est <= 2 * SNAPCOMPACT_FRAME_TOKEN_COST + 100,
+        "frames must bill flat, not by base64 length: {est}"
+    );
+}

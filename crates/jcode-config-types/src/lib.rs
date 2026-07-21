@@ -372,6 +372,10 @@ pub struct CompactionConfig {
 
     /// [semantic] Number of recent turns to look at for building the "current goal" embedding
     pub goal_window_turns: usize,
+
+    /// Opt-in: replace the summary-LLM compaction with deterministic snapcompact
+    /// image frames on vision-capable models. Default false (guests upstream).
+    pub snapcompact: bool,
 }
 
 impl Default for CompactionConfig {
@@ -387,6 +391,7 @@ impl Default for CompactionConfig {
             topic_shift_threshold: 0.45,
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
+            snapcompact: false,
         }
     }
 }

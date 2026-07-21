@@ -12,6 +12,7 @@ members = [
     "crates/jcode-app-core",
     "crates/jcode-base",
     "crates/jcode-hashline",
+    "crates/jcode-snapcompact",
     "crates/jcode-worktree",
     "crates/jcode-tui",
     "crates/jcode-build-meta",
