@@ -272,6 +272,18 @@ profile = "full"
 # Disable all built-in tools unless enabled is set.
 disable_base_tools = false
 
+[skills]
+# Controls which skills load and how they surface to the model. Applies to
+# global sources (Claude Code plugins, ~/.jcode/skills, ~/.agents/skills);
+# project-local .jcode/.agents/.claude skill dirs load unfiltered.
+# Load skills shipped by Claude Code plugins (~/.claude/plugins).
+plugin_import = true
+# Glob patterns of skills to skip entirely (not loaded, not slash-invocable).
+# exclude = ["figma-*"]
+# Glob patterns forced to user-invoked-only: /name still works, but the skill
+# never appears in the system prompt or skill hints.
+# user_invoked_only = ["ponytail"]
+
 [acp]
 # Agent Client Protocol adapter compatibility profile: standard, extended, or full.
 # standard emits only spec-compatible ACP messages.

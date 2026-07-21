@@ -250,11 +250,14 @@ impl SkillRegistry {
         // First-run import from Claude Code / Codex CLI
         Self::import_from_external();
 
+        let skills_cfg = crate::config::config().skills.clone();
         let mut registry = Self::default();
 
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
-        if let Some(plugins_root) = Self::claude_plugins_root() {
+        if skills_cfg.plugin_import
+            && let Some(plugins_root) = Self::claude_plugins_root()
+        {
             registry.load_plugin_skills_from_root(&plugins_root);
         }
 
@@ -273,7 +276,24 @@ impl SkillRegistry {
             registry.load_from_dir(&agents_skills)?;
         }
 
+        registry.apply_skills_config(&skills_cfg);
         Ok(registry)
+    }
+
+    /// Apply `[skills]` config filters: drop excluded skills, force
+    /// `user_invoked_only` matches out of model-facing surfaces.
+    fn apply_skills_config(&mut self, cfg: &crate::config::SkillsConfig) {
+        if !cfg.exclude.is_empty() {
+            self.skills
+                .retain(|name, _| !cfg.exclude.iter().any(|p| glob_match(p, name)));
+        }
+        if !cfg.user_invoked_only.is_empty() {
+            for (name, skill) in self.skills.iter_mut() {
+                if cfg.user_invoked_only.iter().any(|p| glob_match(p, name)) {
+                    skill.disable_model_invocation = true;
+                }
+            }
+        }
     }
 
     /// Load only the project-local skill overlay for a workspace root:
@@ -605,19 +625,21 @@ impl SkillRegistry {
         );
         self.skills.clear();
 
-        let mut count = 0;
+        let skills_cfg = crate::config::config().skills.clone();
 
         // Load skills provided by Claude Code plugins/marketplace installs
         // first, so explicit jcode/agents skills with the same name win below.
-        if let Some(plugins_root) = Self::claude_plugins_root() {
-            count += self.load_plugin_skills_from_root(&plugins_root);
+        if skills_cfg.plugin_import
+            && let Some(plugins_root) = Self::claude_plugins_root()
+        {
+            self.load_plugin_skills_from_root(&plugins_root);
         }
 
         // Load from ~/.jcode/skills/ (jcode's own global skills)
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let jcode_skills = jcode_dir.join("skills");
             if jcode_skills.exists() {
-                count += self.load_from_dir_count(&jcode_skills)?;
+                self.load_from_dir(&jcode_skills)?;
             }
         }
 
@@ -625,10 +647,11 @@ impl SkillRegistry {
         if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
             && agents_skills.exists()
         {
-            count += self.load_from_dir_count(&agents_skills)?;
+            self.load_from_dir(&agents_skills)?;
         }
 
-        Ok(count)
+        self.apply_skills_config(&skills_cfg);
+        Ok(self.skills.len())
     }
 
     /// Load skills from a directory and return count
@@ -978,6 +1001,36 @@ fn build_skill_search_text(name: &str, description: &str, content: &str) -> Stri
     normalize_skill_search_text(&format!("{}\n{}\n{}", name, description, content))
 }
 
+/// Match a skill name against a `[skills]` config pattern: literal match with
+/// `*` as a multi-char wildcard (`figma-*`, `*-review`, `to-*`).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let mut pos = 0;
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !name.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == last {
+            return name.len() >= pos + part.len() && name[pos..].ends_with(part);
+        } else {
+            match name[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
 pub(crate) fn normalize_skill_search_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
@@ -1008,6 +1061,41 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: build_skill_search_text(name, description, content),
         }
+    }
+
+    #[test]
+    fn glob_match_covers_literal_prefix_suffix_and_middle() {
+        assert!(glob_match("herdr", "herdr"));
+        assert!(!glob_match("herdr", "herdr2"));
+        assert!(glob_match("figma-*", "figma-use"));
+        assert!(!glob_match("figma-*", "figma"));
+        assert!(glob_match("*-review", "ponytail-review"));
+        assert!(!glob_match("*-review", "review"));
+        assert!(glob_match("to-*-x", "to-prd-x"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn skills_config_filters_exclude_and_force_user_invoked() {
+        let mut registry = SkillRegistry::default();
+        for name in ["figma-use", "figma-swiftui", "ponytail", "herdr"] {
+            let skill = test_skill(name, "desc", "body");
+            registry.skills.insert(skill.name.clone(), skill);
+        }
+        let cfg = crate::config::SkillsConfig {
+            plugin_import: true,
+            exclude: vec!["figma-*".to_string()],
+            user_invoked_only: vec!["ponytail".to_string()],
+        };
+        registry.apply_skills_config(&cfg);
+
+        assert!(!registry.contains("figma-use"), "excluded by glob");
+        assert!(!registry.contains("figma-swiftui"), "excluded by glob");
+        assert!(
+            registry.get("ponytail").unwrap().disable_model_invocation,
+            "forced user-invoked-only"
+        );
+        assert!(!registry.get("herdr").unwrap().disable_model_invocation);
     }
 
     #[test]
