@@ -301,6 +301,32 @@ async fn read_tool_supports_start_line_with_limit() {
     );
 }
 
+#[test]
+fn hashline_tag_header_disabled_returns_none() {
+    let resolved = std::env::temp_dir().join("jcode-read-hashline-disabled.txt");
+    assert_eq!(
+        hashline_tag_header("sample.txt", &resolved, "one\ntwo\n", false),
+        None
+    );
+}
+
+#[test]
+fn hashline_tag_header_enabled_emits_header_and_records_snapshot() {
+    // Unique path so the process-global store never collides with other tests.
+    let resolved = std::env::temp_dir().join("jcode-read-hashline-enabled.txt");
+    let content = "one\ntwo\nthree\n";
+
+    let header = hashline_tag_header("sample.txt", &resolved, content, true)
+        .expect("enabled should yield a header");
+
+    let tag = jcode_hashline::compute_tag(content);
+    assert_eq!(header, format!("[sample.txt#{tag}]\n"));
+
+    // Snapshot recorded in the SAME store the hashline tool uses for recovery.
+    let recovered = crate::tool::hashline::store().lookup(&resolved.to_string_lossy(), &tag);
+    assert_eq!(recovered.as_deref(), Some(content));
+}
+
 #[tokio::test]
 async fn read_tool_prefers_end_line_over_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
