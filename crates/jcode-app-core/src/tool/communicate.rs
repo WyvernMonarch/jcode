@@ -32,6 +32,8 @@ const LIGHT_MODE_DEFAULT_CONCURRENCY: usize = 4;
 mod transport;
 use transport::{send_request, send_request_with_timeout};
 
+mod isolation;
+
 fn fresh_spawn_request_nonce(ctx: &ToolContext) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1893,6 +1895,11 @@ struct CommunicateInput {
     /// Required and nonblank for the explicit `spawn` action.
     #[serde(default)]
     label: Option<String>,
+    /// For the `spawn` action: run the new agent in an isolated git worktree
+    /// seeded from the parent checkout. Its edits are captured and applied back
+    /// only when the coordinator calls `collect` for its session id. Default false.
+    #[serde(default)]
+    isolated: Option<bool>,
 }
 
 impl CommunicateInput {
@@ -1953,7 +1960,7 @@ impl Tool for CommunicateTool {
                 "action": {
                     "type": "string",
                     "enum": ["share", "share_append", "read", "message", "broadcast", "dm", "channel", "list", "list_channels", "channel_members",
-                             "propose_plan", "approve_plan", "reject_plan", "spawn", "stop", "assign_role",
+                             "propose_plan", "approve_plan", "reject_plan", "spawn", "collect", "stop", "assign_role",
                              "status", "report", "plan_status", "summary", "read_context", "resync_plan", "assign_task", "assign_next", "fill_slots", "run_plan", "cleanup",
                              "task_graph", "expand_node", "complete_node", "inject_gap",
                              "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
@@ -2013,6 +2020,10 @@ impl Tool for CommunicateTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for spawn."
+                },
+                "isolated": {
+                    "type": "boolean",
+                    "description": "For spawn: run the new agent in an isolated git worktree seeded from the parent checkout (default false). Its edits are held aside and applied back to the parent only when you call action=collect with target_session set to the spawned session id. Requires the spawn working_dir (or the coordinator's cwd) to be inside a git repo; falls back to a plain spawn with a note otherwise. On collect, a conflicting delta is not forced: the conflict is reported and the patch saved to a file for manual apply."
                 },
                 "prompt": {
                     "type": "string",
@@ -2713,10 +2724,43 @@ impl Tool for CommunicateTool {
 
             "spawn" => {
                 let label = params.required_spawn_label()?;
+                // Opt-in isolation: build a git worktree seeded from the parent checkout and
+                // point the spawn at it, so the member's edits can be collected + applied back
+                // atomically later. Falls back to a plain spawn (with a note) when the target
+                // dir is not a git repo or the worktree can't be seeded.
+                let mut spawn_working_dir = params.working_dir.clone();
+                let mut pending_isolation: Option<isolation::IsolatedSpawn> = None;
+                let mut isolation_note = String::new();
+                if params.isolated.unwrap_or(false) {
+                    let base = params
+                        .working_dir
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| ctx.working_dir.clone());
+                    match base {
+                        Some(dir) => match isolation::create_isolated_spawn(&dir, &ctx.session_id) {
+                            Ok(iso) => {
+                                spawn_working_dir = Some(iso.path().display().to_string());
+                                pending_isolation = Some(iso);
+                            }
+                            Err(e) => {
+                                isolation_note = format!(
+                                    "\nNote: isolation requested but unavailable ({e}); spawned in the original directory."
+                                );
+                            }
+                        },
+                        None => {
+                            isolation_note =
+                                "\nNote: isolation requested but no working_dir is known; spawned without isolation."
+                                    .to_string();
+                        }
+                    }
+                }
+
                 let request = Request::CommSpawn {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
-                    working_dir: params.working_dir.clone(),
+                    working_dir: spawn_working_dir,
                     initial_message: params.spawn_initial_message(),
                     request_nonce: None,
                     spawn_mode: params.spawn_mode.clone(),
@@ -2729,18 +2773,47 @@ impl Tool for CommunicateTool {
                     Ok(ServerEvent::CommSpawnResponse { new_session_id, .. })
                         if !new_session_id.is_empty() =>
                     {
+                        let suffix = match pending_isolation {
+                            Some(iso) => {
+                                let path = iso.path().display().to_string();
+                                isolation::register(&new_session_id, iso);
+                                format!(
+                                    "\nIsolated in worktree {path}. After it finishes, call swarm action=\"collect\" target_session=\"{new_session_id}\" to apply its changes back to the parent checkout."
+                                )
+                            }
+                            None => isolation_note,
+                        };
                         Ok(ToolOutput::new(format!(
-                            "Spawned new agent: {}",
-                            new_session_id
+                            "Spawned new agent: {new_session_id}{suffix}"
                         )))
                     }
                     Ok(response) => {
+                        if let Some(iso) = pending_isolation {
+                            iso.cleanup();
+                        }
                         ensure_success(&response)?;
                         Err(anyhow::anyhow!(
                             "Spawn succeeded but new session ID was not returned."
                         ))
                     }
-                    Err(e) => Err(anyhow::anyhow!("Failed to spawn agent: {}", e)),
+                    Err(e) => {
+                        if let Some(iso) = pending_isolation {
+                            iso.cleanup();
+                        }
+                        Err(anyhow::anyhow!("Failed to spawn agent: {}", e))
+                    }
+                }
+            }
+
+            "collect" => {
+                let target = params.target_session.clone().ok_or_else(|| {
+                    anyhow::anyhow!("'target_session' is required for collect action")
+                })?;
+                match isolation::take(&target) {
+                    Some(iso) => Ok(ToolOutput::new(isolation::collect(iso, &target)?)),
+                    None => Ok(ToolOutput::new(format!(
+                        "No isolated worktree is tracked for session {target}. It was either not spawned with isolated=true, already collected, or spawned before a server reload (its worktree, if any, can be pruned with `git worktree prune`)."
+                    ))),
                 }
             }
 

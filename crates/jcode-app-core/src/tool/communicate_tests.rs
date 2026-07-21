@@ -1063,6 +1063,29 @@ fn spawn_label_validation_rejects_missing_or_blank_labels() {
 }
 
 #[test]
+fn isolated_flag_parses_and_defaults_false() {
+    let explicit: CommunicateInput = serde_json::from_value(json!({
+        "action": "spawn",
+        "label": "worker",
+        "isolated": true
+    }))
+    .expect("spawn input");
+    assert_eq!(explicit.isolated, Some(true));
+
+    // Omitted => None (treated as false at the call site).
+    let default: CommunicateInput =
+        serde_json::from_value(json!({"action": "spawn", "label": "worker"}))
+            .expect("spawn input");
+    assert_eq!(default.isolated, None);
+
+    let collect: CommunicateInput =
+        serde_json::from_value(json!({"action": "collect", "target_session": "cat-9"}))
+            .expect("collect input");
+    assert_eq!(collect.action, "collect");
+    assert_eq!(collect.target_session.as_deref(), Some("cat-9"));
+}
+
+#[test]
 fn spawn_label_validation_trims_valid_labels() {
     let params: CommunicateInput = serde_json::from_value(json!({
         "action": "spawn",
