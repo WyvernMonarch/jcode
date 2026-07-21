@@ -114,6 +114,14 @@ impl Config {
         Self::set_default_model(model, cfg.provider.default_provider.as_deref())
     }
 
+    /// Replace the `[skills].exclude` list in the config file.
+    pub fn set_skills_exclude(exclude: Vec<String>) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.skills.exclude = exclude;
+        cfg.save()?;
+        Ok(())
+    }
+
     /// Update the persisted OpenAI reasoning effort preference.
     pub fn set_openai_reasoning_effort(value: Option<&str>) -> anyhow::Result<()> {
         let mut cfg = Self::load();

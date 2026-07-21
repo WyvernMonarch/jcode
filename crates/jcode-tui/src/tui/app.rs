@@ -1292,6 +1292,9 @@ pub struct App {
     model_picker_load_request_id: u64,
     // Pending model switch from picker (for remote mode async processing)
     pending_model_switch: Option<String>,
+    /// Set by /skills-setup save in remote mode: ask the server to reload its
+    /// global skill registry on the next remote pump tick.
+    pub(super) pending_skills_reload: bool,
     pending_route_selection: Option<crate::provider::RouteSelection>,
     // Reasoning-effort variant chosen together with a model in the picker
     // (e.g. "gpt-5.5 (high)"), staged for remote mode alongside the model
